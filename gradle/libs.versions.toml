@@ -1,12 +1,34 @@
 [versions]
 agp = "8.12.2"
 kotlin = "2.2.10"
+work = "2.10.3"
+idgenerator = "1.0.6"
+room = "2.7.2"
+paging = "3.3.6"
+network = "1.0.0-alpha4"
+
+composeBom = "2025.08.01"
 
 
 [libraries]
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+androidx-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+androidx-foundation = { group = "androidx.compose.foundation", name = "foundation" }
+androidx-work = {module = "androidx.work:work-runtime-ktx",version.ref = "work"}
+androidx-material3 = { group = "androidx.compose.material3", name = "material3" }
+androidx-icon-extend = { group = "androidx.compose.material", name = "material-icons-extended" }
+
+idgenerator = {module = "com.github.yitter:yitter-idgenerator",version.ref = "idgenerator"}
+androidx-room-runtime = {module = "androidx.room:room-runtime",version.ref = "room"}
+androidx-room-ktx = {module="androidx.room:room-ktx",version.ref = "room"}
+androidx-room-paging = {module = "androidx.room:room-paging",version.ref = "room"}
+androidx-paging = {module = "androidx.paging:paging-runtime",version.ref = "paging"}
+androidx-paging-compose = {module = "androidx.paging:paging-compose",version.ref = "paging"}
+network = {module = "com.github.Caleb-Rainbow:ktor",version.ref = "network"}
 
 [plugins]
 android-library = { id = "com.android.library", version.ref = "agp" }
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
-
+compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
