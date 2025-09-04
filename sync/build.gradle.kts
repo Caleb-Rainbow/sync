@@ -29,7 +29,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlin {
-        compilerOptions{
+        compilerOptions {
             jvmTarget = JvmTarget.fromTarget("17")
         }
     }
@@ -44,14 +44,15 @@ android {
         buildConfig = true
     }
 }
+publishing {
+    publications {
+        create<MavenPublication>("release") {
+            groupId = "com.github.Caleb-Rainbow"
+            artifactId = "sync"
+            version = "1.0.0-alpha1"
 
-afterEvaluate {
-    publishing {
-        publications {
-            create<MavenPublication>("release") {
-                groupId = "com.github.Caleb-Rainbow"
-                artifactId = "sync"
-                version = "1.0.0-alpha1"
+            afterEvaluate {
+                from(components["release"])
             }
         }
     }
