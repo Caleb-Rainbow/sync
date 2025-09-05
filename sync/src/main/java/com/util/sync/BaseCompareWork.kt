@@ -47,7 +47,7 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
         failureMessages: MutableList<String>,
         onLocalUpdate: (T) -> Unit = {},
         onRemoteUpdate: (T) -> Unit = {},
-    ): T {
+    ): T? {
         return data // 默认：原样返回
     }
 
@@ -63,7 +63,7 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
         failureMessages: MutableList<String>,
         onLocalUpdate: (T) -> Unit = {},
         onRemoteUpdate: (T) -> Unit = {},
-    ): T {
+    ): T? {
         return data // 默认：原样返回
     }
 
@@ -137,6 +137,10 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                 logger.info("🔄 本次需要处理的总项目数 (去重后): ${allIds.size} 个, ID: ${allIds.toLogString()}")
 
                 if (allIds.isEmpty()) {
+                    if (failureMessages.isNotEmpty()){
+                        logger.error("❌ 没有需要同步的项目，任务提前完成，但出现 ${failureMessages.size} 个错误。${failureMessages.joinToString("\n")}")
+                        return@withContext Result.failure(createFailData(failureMessages.joinToString("\n")))
+                    }
                     logger.info("没有需要同步的项目，任务提前完成。")
                     return@withContext Result.success(createSuccessData("没有需要同步的$syncOptionName"))
                 }
@@ -169,10 +173,12 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                         SyncOption.DEVICE_UPLOAD -> localData?.let {
                             logger.info("   - 模式: [仅上传]. 准备上传本地数据。")
                             val processed = handleLocalDataForUpload(it, logger, failureMessages)
-                            updatedRemoteData.add(processed)
-                            if (processed != it) {
-                                updatedLocalData.add(processed)
-                                handleFilesToDelete(processed,it)
+                            processed?.let { element ->
+                                updatedRemoteData.add(element)
+                                if (element != it) {
+                                    updatedLocalData.add(element)
+                                    handleFilesToDelete(element,it)
+                                }
                             }
                             summaryStats["uploaded"] = summaryStats.getOrDefault("uploaded", 0) + 1
                         }
@@ -180,7 +186,9 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                         SyncOption.SERVER_DOWNLOAD -> remoteData?.let {
                             logger.info("   - 模式: [仅下载]. 准备下载服务端数据。")
                             val processed = handleRemoteDataForDownload(it, logger, failureMessages)
-                            updatedLocalData.add(processed)
+                            processed?.let { element ->
+                                updatedLocalData.add(element)
+                            }
                             summaryStats["downloaded"] = summaryStats.getOrDefault("downloaded", 0) + 1
                         }
 
@@ -188,21 +196,26 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                             remoteData == null && localData != null -> {
                                 logger.info("   - 模式: [双向同步]. 服务端无此数据，本地存在。作为新数据上传。")
                                 val processed = handleLocalDataForUpload(localData, logger, failureMessages)
-                                updatedRemoteData.add(processed)
-                                if (processed != localData) {
-                                    updatedLocalData.add(processed)
-                                    handleFilesToDelete(processed,localData)
+                                processed?.let {
+                                    updatedRemoteData.add(it)
+                                    if (it != localData) {
+                                        updatedLocalData.add(it)
+                                        handleFilesToDelete(it,localData)
+                                    }
                                 }
+
                                 summaryStats["uploaded"] = summaryStats.getOrDefault("uploaded", 0) + 1
                             }
 
                             remoteData != null && localData == null -> {
                                 logger.info("   - 模式: [双向同步]. 本地无此数据，服务端存在。作为新数据下载。")
                                 val processed = handleRemoteDataForDownload(remoteData, logger, failureMessages)
-                                updatedLocalData.add(processed)
-                                if (processed != remoteData) {
-                                    updatedRemoteData.add(processed)
-                                    handleFilesToDelete(processed,remoteData)
+                                processed?.let {
+                                    updatedLocalData.add(it)
+                                    if (it != remoteData) {
+                                        updatedRemoteData.add(it)
+                                        handleFilesToDelete(it,remoteData)
+                                    }
                                 }
                                 summaryStats["downloaded"] = summaryStats.getOrDefault("downloaded", 0) + 1
                             }
@@ -214,19 +227,25 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                                     remoteData.updateTime > localData.updateTime -> {
                                         logger.info("     - 决策: 服务端数据较新，执行下载操作。")
                                         val processed = handleRemoteDataForDownload(remoteData, logger, failureMessages)
-                                        updatedLocalData.add(processed)
-                                        if (processed != remoteData) updatedRemoteData.add(processed)
+                                        processed?.let {
+                                            updatedLocalData.add(it)
+                                            if (processed != remoteData) updatedRemoteData.add(it)
+                                        }
+
                                         summaryStats["downloaded"] = summaryStats.getOrDefault("downloaded", 0) + 1
                                     }
 
                                     localData.updateTime > remoteData.updateTime -> {
                                         logger.info("     - 决策: 本地数据较新，执行上传操作。")
                                         val processed = handleLocalDataForUpload(localData, logger, failureMessages)
-                                        updatedRemoteData.add(processed)
-                                        if (processed != localData) {
-                                            updatedLocalData.add(processed)
-                                            handleFilesToDelete(processed,localData)
+                                        processed?.let {
+                                            updatedRemoteData.add(it)
+                                            if (it != localData) {
+                                                updatedLocalData.add(it)
+                                                handleFilesToDelete(it,localData)
+                                            }
                                         }
+
                                         summaryStats["uploaded"] = summaryStats.getOrDefault("uploaded", 0) + 1
                                     }
 
