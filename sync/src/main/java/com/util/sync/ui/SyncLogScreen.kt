@@ -67,7 +67,7 @@ import com.util.sync.data.SyncLog
 @Composable
 fun SyncLogScreen(
     modifier: Modifier,
-    goBack: () -> Unit,
+    goBack: (() -> Unit)? = null,
     viewModel: SyncLogViewModel,
     syncConfigProvider: SyncConfigProvider,
     workerNameResolver: (String) -> String,
@@ -83,16 +83,19 @@ fun SyncLogScreen(
                     containerColor = Color.Transparent,
                 ),
                 navigationIcon = {
-                    Icon(
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clickable { goBack() },
-                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                        contentDescription = null
-                    )
+                    goBack?.let {back->
+                        Icon(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clickable { back() },
+                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                            contentDescription = null
+                        )
+                    }
                 }
             )
         }
+        , containerColor = Color.Transparent
     ) { paddingValues ->
         val sessionGroup = uiState.sessionLogs?.collectAsLazyPagingItems()
         sessionGroup?.let { list ->
