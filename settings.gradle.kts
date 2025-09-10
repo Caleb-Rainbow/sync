@@ -25,7 +25,7 @@ include(":app")
 /*includeBuild("F:\\CodeProject\\AndroidComposeProject\\NetworkMoudle"){
     dependencySubstitution {
         // 这里的 :Ktor-Network 是指库项目中 rootProject.name
-        substitute(module("com.github.Caleb-Rainbow:ktor"))
+        substitute(module("com.github.Caleb-Rainbow:Ktor-Network"))
             .using(project(":ktor"))
     }
 }*/
