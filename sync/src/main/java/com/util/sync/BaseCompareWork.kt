@@ -7,6 +7,8 @@ import androidx.work.WorkerParameters
 import com.github.yitter.idgen.YitIdHelper
 import com.util.sync.data.SyncLogger
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.let
@@ -81,7 +83,8 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
             logger.info("   - 上次同步时间: $lastSyncTime")
 
             if (lastSyncTime == null) {
-                val errorMsg = "严重错误：未能获取到上次同步时间，任务中止。"
+                val errorMsg = "严重错误：" +
+                        "未能获取到上次同步时间，任务中止。"
                 logger.error(errorMsg)
                 return@withContext Result.failure(createFailData(errorMsg))
             }
@@ -97,6 +100,8 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
             val filesToDeleteAfterSuccess = mutableMapOf<Long, String>()
             // 新增日志: 用于统计操作摘要
             val summaryStats = mutableMapOf("downloaded" to 0, "uploaded" to 0, "skipped" to 0)
+            // 定义一个数据类来封装每个ID的获取结果
+            data class FetchedData(val id: Long, val local: T?, val remote: T?, val error: String? = null)
             //处理上传成功后需要删除的本地文件
             fun handleFilesToDelete(processed: SyncableEntity,data: SyncableEntity){
                 if (processed.getPhotoPath().isNullOrEmpty().not() && processed.getPhotoPath() != data.getPhotoPath()) {
@@ -144,29 +149,55 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                     logger.info("没有需要同步的项目，任务提前完成。")
                     return@withContext Result.success(createSuccessData("没有需要同步的$syncOptionName"))
                 }
+                // --- 步骤 2: 分批并发获取所有项目的详细数据 ---
+                logger.info("⚙️ 开始分批并发获取项目数据，每批 ${syncConfig.batchSize} 个。")
+                val allFetchedData = allIds.chunked(syncConfig.batchSize).flatMap { batchIds ->
+                    // 对每个批次，并发获取数据
+                    batchIds.map { itemId ->
+                        async { // 为每个ID启动一个async协程
+                            try {
+                                val remoteDataResult = if (syncOption == SyncOption.SERVER_DOWNLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
+                                    repository.remoteGetById(itemId)
+                                } else null
 
+                                // 如果获取远程数据失败，记录下来但不要中断整个流程
+                                if (remoteDataResult?.isError() == true) {
+                                    val errorMsg = "获取服务端 $syncOptionName (ID: $itemId) 的详细信息失败: ${remoteDataResult.message}"
+                                    logger.error(errorMsg)
+                                    failureMessages.add(errorMsg)
+                                    // 返回一个包含错误信息的结果
+                                    return@async FetchedData(id = itemId, local = null, remote = null, error = errorMsg)
+                                }
+
+                                val localData = if (syncOption == SyncOption.DEVICE_UPLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
+                                    repository.localGetById(itemId)
+                                } else null
+
+                                FetchedData(id = itemId, local = localData, remote = remoteDataResult?.data)
+                            } catch (e: Exception) {
+                                val errorMsg = "获取 ID $itemId 数据时发生意外异常: ${e.message}"
+                                logger.error(errorMsg)
+                                failureMessages.add(errorMsg)
+                                FetchedData(id = itemId, local = null, remote = null, error = errorMsg)
+                            }
+                        }
+                    }.awaitAll() // 等待当前批次的所有任务完成
+                }
+
+                // --- 步骤 3: 集中处理所有已获取的数据 ---
+                logger.info("集中处理所有已获取的数据...")
                 val updatedLocalData = mutableListOf<T>()
                 val updatedRemoteData = mutableListOf<T>()
 
-                // --- 步骤 2: 逐个处理项目 ---
-                for (itemId in allIds) {
-                    logger.info("--- 正在处理项目 ID: $itemId ---")
-
-                    val remoteDataResult = if (syncOption == SyncOption.SERVER_DOWNLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
-                        repository.remoteGetById(itemId)
-                    } else null
-
-                    if (remoteDataResult?.isError() == true) {
-                        val errorMsg = "获取服务端 $syncOptionName (ID: $itemId) 的详细信息失败: ${remoteDataResult.message}"
-                        logger.error(errorMsg)
-                        failureMessages.add(errorMsg)
-                        continue // 跳过此项目
+                for (fetched in allFetchedData) {
+                    // 跳过在获取阶段就失败的项目
+                    if (fetched.error != null) {
+                        summaryStats["failed_fetch"] = summaryStats.getOrDefault("failed_fetch", 0) + 1
+                        continue
                     }
-                    val remoteData = remoteDataResult?.data
 
-                    val localData = if (syncOption == SyncOption.DEVICE_UPLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
-                        repository.localGetById(itemId)
-                    } else null
+                    val localData = fetched.local
+                    val remoteData = fetched.remote
 
                     // 新增日志: 详细记录决策逻辑
                     when (syncOption) {
@@ -261,7 +292,7 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                     }
                 }
 
-                // --- 步骤 3: 批量更新 ---
+                // --- 步骤 4: 批量更新 ---
                 if (updatedRemoteData.isNotEmpty()) {
                     val idsToUpdate = updatedRemoteData.map { it.id }.toLogString() // 新增日志: 获取待更新的ID列表
                     logger.info("☁️ 开始批量上传 ${updatedRemoteData.size} 个项目到服务器。ID: $idsToUpdate")

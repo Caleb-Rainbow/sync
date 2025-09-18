@@ -1,13 +1,13 @@
 [versions]
 agp = "8.13.0"
-kotlin = "2.2.10"
-work = "2.10.3"
+kotlin = "2.2.20"
+work = "2.10.4"
 idgenerator = "1.0.6"
-room = "2.7.2"
+room = "2.8.0"
 paging = "3.3.6"
-network = "1.0.0-rc2"
+network = "1.0.0-rc3"
 
-composeBom = "2025.08.01"
+composeBom = "2025.09.00"
 
 
 [libraries]

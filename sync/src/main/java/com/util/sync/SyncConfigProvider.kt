@@ -15,6 +15,7 @@ interface SyncConfigProvider {
     var isHeartbeat: Boolean
     var heartbeatPeriod: Int
     var deviceNumber: String
+    var batchSize: Int
 
     /**
      * 保存最近一次同步成功的时间戳。
