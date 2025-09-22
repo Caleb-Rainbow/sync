@@ -11,10 +11,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
@@ -318,12 +320,13 @@ private fun WorkerLogGroupItem(
 
         // 展开后显示该Worker的日志列表
         AnimatedVisibility(visible = isExpanded) {
-            Column(
+            LazyColumn (
                 modifier = Modifier
                     .fillMaxWidth()
+                    .heightIn(max = 300.dp)
                     .padding(start = 16.dp, bottom = 8.dp) // 缩进以表示层级
             ) {
-                logs.forEach { log ->
+                items(logs){ log ->
                     LogEntryItem(log)
                     if (log != logs.last()) HorizontalDivider(
                         Modifier,

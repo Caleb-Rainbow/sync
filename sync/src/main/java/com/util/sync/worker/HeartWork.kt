@@ -23,9 +23,9 @@ class HeartWork(
     private val syncConfigProvider: SyncConfigProvider,
 ) : CoroutineWorker(appContext, workerParams) {
     override suspend fun doWork() = withContext(Dispatchers.IO) {
-        if (syncConfigProvider.isHeartbeat.not()) Result.success(createSuccessData("未开启心跳"))
-        if (syncConfigProvider.username.isNotEmpty()) {
-            Result.failure(createFailData("未校验"))
+        if (syncConfigProvider.isHeartbeat.not())return@withContext  Result.success(createSuccessData("未开启心跳"))
+        if (syncConfigProvider.username.isEmpty()) {
+           return@withContext Result.failure(createFailData("未校验"))
         }
         Log.d("HeartWork", "doWork: 心跳执行")
         val result = heartRepository.heartbeat(
@@ -33,9 +33,9 @@ class HeartWork(
             second = syncConfigProvider.heartbeatPeriod
         )
         if (result.isSuccess()) {
-            Result.success()
+            return@withContext Result.success()
         } else {
-            Result.failure(createFailData("心跳失败,错误码->${result.code} ${result.message}"))
+            return@withContext Result.failure(createFailData("心跳失败,错误码->${result.code} ${result.message}"))
         }
     }
 }
