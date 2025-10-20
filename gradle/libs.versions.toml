@@ -3,11 +3,11 @@ agp = "8.13.0"
 kotlin = "2.2.20"
 work = "2.10.5"
 idgenerator = "1.0.6"
-room = "2.8.1"
+room = "2.8.2"
 paging = "3.3.6"
-network = "1.0.0"
+network = "1.0.1"
 
-composeBom = "2025.09.01"
+composeBom = "2025.10.00"
 
 
 [libraries]
