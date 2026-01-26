@@ -29,7 +29,7 @@ SyncMoudle 是一个功能强大且灵活的 Android 数据同步库，旨在简
 - **四种同步模式**：支持设备单向上传、服务器单向下发、双向同步和关闭同步
 - **智能冲突解决**：基于时间戳的自动冲突检测与解决机制
 - **批量处理**：支持分批并发获取和处理数据，提高同步效率
-- **完善的日志系统**：记录详细的同步过程，便于调试和问题追踪
+- **灵活的日志系统**：支持依赖注入的日志接口，便于应用层自定义日志实现
 - **灵活的配置**：支持心跳机制、文件删除、批量大小等配置选项
 - **可扩展架构**：基于接口设计，易于扩展和自定义
 
@@ -69,12 +69,12 @@ SyncMoudle 是一个功能强大且灵活的 Android 数据同步库，旨在简
 - 并发处理多个数据项，提高同步效率
 - 可配置批量大小
 
-### 5. 完善的日志系统
+### 5. 灵活的日志系统
 
-- 记录每次同步会话的详细信息
-- 支持按会话ID查询日志
-- 自动清理过期日志
-- 提供 UI 界面查看同步日志
+- 支持依赖注入的日志接口，由应用层实现具体日志逻辑
+- 提供丰富的日志扩展函数（info、warn、error等）
+- 支持操作日志记录，便于追踪关键操作
+- 支持惰性日志，避免不必要的字符串拼接开销
 
 ### 6. 灵活的配置选项
 
@@ -114,11 +114,12 @@ SyncMoudle 是一个功能强大且灵活的 Android 数据同步库，旨在简
 ┌─────────────────────────────────────────────────────────────────┐
 │                         Application Layer                         │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
-│  │ SyncLogScreen│  │   ViewModel  │  │   Repository │           │
+│  │  LibLogMgr   │  │   ViewModel  │  │   Repository │           │
+│  │  (日志注入)   │  │              │  │              │           │
 │  └──────────────┘  └──────────────┘  └──────────────┘           │
 └─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
+                                 │
+                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Sync Library Layer                        │
 │  ┌──────────────────────────────────────────────────────────┐   │
@@ -140,13 +141,13 @@ SyncMoudle 是一个功能强大且灵活的 Android 数据同步库，旨在简
 │  │              (数据访问接口定义)                             │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
+                                 │
+                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      Data & Logging Layer                       │
+│                        Logging Layer                            │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
-│  │ SyncLog      │  │ SyncLogDao   │  │ SyncLogger   │           │
-│  │ (日志实体)    │  │ (日志DAO)    │  │ (日志记录器)  │           │
+│  │ ILibLogger   │  │ LibLogManager│  │  扩展函数    │           │
+│  │ (日志接口)    │  │  (日志单例)    │  │ (libLogX)   │           │
 │  └──────────────┘  └──────────────┘  └──────────────┘           │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -173,18 +174,28 @@ class SyncWorkManager(val context: Context) {
 - `syncOptionName`: 同步选项名称
 - `repository`: 数据仓库
 - `syncOptionInt`: 同步选项整数值
-- `logger`: 日志记录器
 - `syncConfig`: 同步配置
+
+**支持的同步模式**：
+- **ID 单查模式** (syncMode = 0)：先获取 ID 列表，再逐个获取详情
+- **批量模式** (syncMode = 1)：直接批量获取完整数据，性能更优
 
 #### 3. SyncRepository<T>
 数据访问接口，定义了本地和远程数据的 CRUD 操作。
 
 ```kotlin
 interface SyncRepository<T : SyncableEntity> {
+    // ID 单查模式 (已标记为 @Deprecated)
     suspend fun remoteGetAfterUpdateTime(lastSyncTime: String): ResultModel<List<Long>>
     suspend fun localGetAfterUpdateTime(lastSyncTime: String): List<Long>
     suspend fun remoteGetById(id: Long): ResultModel<T>
     suspend fun localGetById(id: Long): T?
+
+    // 批量查询模式 (推荐使用)
+    suspend fun remoteGetAfterUpdateTimeBatch(lastSyncTime: String): ResultModel<List<T>>
+    suspend fun localGetAfterUpdateTimeBatch(lastSyncTime: String): List<T>
+
+    // 批量更新
     suspend fun remoteBatchUpsert(data: List<T>): ResultModel<String>
     suspend fun localBatchUpsert(data: List<T>)
 }
@@ -223,20 +234,42 @@ interface SyncConfigProvider {
 }
 ```
 
-#### 6. SyncLogger
-日志记录器，用于记录同步过程中的详细信息。
+#### 6. ILibLogger
+
+日志接口，用于记录同步过程中的详细信息。采用依赖注入的方式，由应用层实现。
 
 ```kotlin
-class SyncLogger(
-    private val workerName: String,
-    private val syncLogDao: SyncLogDao
-) {
-    suspend fun info(message: String)
-    suspend fun warn(message: String)
-    suspend fun error(message: String)
-    fun setSessionId(sessionId: String)
+interface ILibLogger {
+    fun v(tag: String, msg: String)
+    fun d(tag: String, msg: String)
+    fun i(tag: String, msg: String)
+    fun w(tag: String, msg: String)
+    fun e(tag: String, msg: String, tr: Throwable?)
+    fun logOperation(tag: String, type: String, result: String, params: Map<String, Any?>)
 }
 ```
+
+**使用方式**：
+
+1. 实现 `ILibLogger` 接口
+2. 通过 `LibLogManager.init()` 注入
+3. 在库中使用扩展函数 `libLogD()`, `libLogI()`, `libLogE()` 等
+
+**示例**：
+```kotlin
+LibLogManager.init(object : ILibLogger {
+    override fun i(tag: String, msg: String) {
+        Log.i(tag, msg)
+    }
+    override fun e(tag: String, msg: String, tr: Throwable?) {
+        Log.e(tag, msg, tr)
+    }
+    // ... 其他方法
+})
+
+// 在代码中使用
+libLogI("同步开始")
+libLogE("同步失败", exception)
 
 ### 同步流程图
 
@@ -492,7 +525,6 @@ class UserDataSyncWorker(
     context: Context,
     workerParameters: WorkerParameters,
     private val repository: UserDataRepository,
-    private val logger: SyncLogger,
     private val syncConfig: SyncConfigProvider
 ) : BaseCompareWork<User, UserDataRepository>(context, workerParameters) {
 
@@ -501,12 +533,10 @@ class UserDataSyncWorker(
     override val syncOptionName: String = "用户数据"
     override val repository: UserDataRepository = this.repository
     override val syncOptionInt: Int = 2 // TWO_WAY_SYNC
-    override val logger: SyncLogger = this.logger
     override val syncConfig: SyncConfigProvider = this.syncConfig
 
     override suspend fun handleLocalDataForUpload(
         data: User,
-        logger: SyncLogger,
         failureMessages: MutableList<String>,
         onLocalUpdate: (User) -> Unit,
         onRemoteUpdate: (User) -> Unit
@@ -521,7 +551,6 @@ class UserDataSyncWorker(
 
     override suspend fun handleRemoteDataForDownload(
         data: User,
-        logger: SyncLogger,
         failureMessages: MutableList<String>,
         onLocalUpdate: (User) -> Unit,
         onRemoteUpdate: (User) -> Unit
@@ -621,7 +650,6 @@ flow.collect { workInfos ->
 | `syncOptionName` | String | 同步选项名称 |
 | `repository` | R | 数据仓库实例 |
 | `syncOptionInt` | Int | 同步选项整数值 |
-| `logger` | SyncLogger | 日志记录器 |
 | `syncConfig` | SyncConfigProvider | 同步配置 |
 
 #### 钩子方法
@@ -633,7 +661,6 @@ flow.collect { workInfos ->
 ```kotlin
 open suspend fun handleLocalDataForUpload(
     data: T,
-    logger: SyncLogger,
     failureMessages: MutableList<String>,
     onLocalUpdate: (T) -> Unit = {},
     onRemoteUpdate: (T) -> Unit = {},
@@ -642,7 +669,6 @@ open suspend fun handleLocalDataForUpload(
 
 **参数**：
 - `data`: 待上传的本地数据
-- `logger`: 日志记录器
 - `failureMessages`: 失败消息列表
 - `onLocalUpdate`: 本地更新回调
 - `onRemoteUpdate`: 远程更新回调
@@ -654,7 +680,6 @@ open suspend fun handleLocalDataForUpload(
 ```kotlin
 override suspend fun handleLocalDataForUpload(
     data: User,
-    logger: SyncLogger,
     failureMessages: MutableList<String>,
     onLocalUpdate: (User) -> Unit,
     onRemoteUpdate: (User) -> Unit
@@ -663,10 +688,10 @@ override suspend fun handleLocalDataForUpload(
     data.photoPath?.let { path ->
         try {
             val remoteUrl = uploadFileToServer(path)
-            logger.info("头像上传成功: $remoteUrl")
+            libLogI("头像上传成功: $remoteUrl")
             return data.copy(photoUrl = remoteUrl)
         } catch (e: Exception) {
-            logger.error("头像上传失败: ${e.message}")
+            libLogE("头像上传失败: ${e.message}", e)
             failureMessages.add("头像上传失败")
             return null
         }
@@ -682,7 +707,6 @@ override suspend fun handleLocalDataForUpload(
 ```kotlin
 open suspend fun handleRemoteDataForDownload(
     data: T,
-    logger: SyncLogger,
     failureMessages: MutableList<String>,
     onLocalUpdate: (T) -> Unit = {},
     onRemoteUpdate: (T) -> Unit = {},
@@ -691,7 +715,6 @@ open suspend fun handleRemoteDataForDownload(
 
 **参数**：
 - `data`: 待处理的远程数据
-- `logger`: 日志记录器
 - `failureMessages`: 失败消息列表
 - `onLocalUpdate`: 本地更新回调
 - `onRemoteUpdate`: 远程更新回调
@@ -703,7 +726,6 @@ open suspend fun handleRemoteDataForDownload(
 ```kotlin
 override suspend fun handleRemoteDataForDownload(
     data: User,
-    logger: SyncLogger,
     failureMessages: MutableList<String>,
     onLocalUpdate: (User) -> Unit,
     onRemoteUpdate: (User) -> Unit
@@ -712,10 +734,10 @@ override suspend fun handleRemoteDataForDownload(
     data.photoUrl?.let { url ->
         try {
             val localPath = downloadFileFromServer(url)
-            logger.info("头像下载成功: $localPath")
+            libLogI("头像下载成功: $localPath")
             return data.copy(photoPath = localPath)
         } catch (e: Exception) {
-            logger.error("头像下载失败: ${e.message}")
+            libLogE("头像下载失败: ${e.message}", e)
             failureMessages.add("头像下载失败")
             return null
         }
@@ -730,9 +752,25 @@ override suspend fun handleRemoteDataForDownload(
 
 #### 方法
 
+##### `remoteGetAfterUpdateTimeBatch`
+
+远程获取上次同步时间之后更新过的完整数据列表（批量模式，推荐使用）。
+
+```kotlin
+suspend fun remoteGetAfterUpdateTimeBatch(lastSyncTime: String): ResultModel<List<T>>
+```
+
+##### `localGetAfterUpdateTimeBatch`
+
+本地获取上次同步时间之后更新过的完整数据列表（批量模式，推荐使用）。
+
+```kotlin
+suspend fun localGetAfterUpdateTimeBatch(lastSyncTime: String): List<T>
+```
+
 ##### `remoteGetAfterUpdateTime`
 
-远程获取上次同步时间之后更新过的 ID 列表。
+远程获取上次同步时间之后更新过的 ID 列表（已标记为 Deprecated）。
 
 ```kotlin
 suspend fun remoteGetAfterUpdateTime(lastSyncTime: String): ResultModel<List<Long>>
@@ -740,7 +778,7 @@ suspend fun remoteGetAfterUpdateTime(lastSyncTime: String): ResultModel<List<Lon
 
 ##### `localGetAfterUpdateTime`
 
-本地获取上次同步时间之后更新过的 ID 列表。
+本地获取上次同步时间之后更新过的 ID 列表（已标记为 Deprecated）。
 
 ```kotlin
 suspend fun localGetAfterUpdateTime(lastSyncTime: String): List<Long>
@@ -748,7 +786,7 @@ suspend fun localGetAfterUpdateTime(lastSyncTime: String): List<Long>
 
 ##### `remoteGetById`
 
-远程根据 ID 获取单个实体。
+远程根据 ID 获取单个实体（已标记为 Deprecated）。
 
 ```kotlin
 suspend fun remoteGetById(id: Long): ResultModel<T>
@@ -756,7 +794,7 @@ suspend fun remoteGetById(id: Long): ResultModel<T>
 
 ##### `localGetById`
 
-本地根据 ID 获取单个实体。
+本地根据 ID 获取单个实体（已标记为 Deprecated）。
 
 ```kotlin
 suspend fun localGetById(id: Long): T?
@@ -793,6 +831,7 @@ suspend fun localBatchUpsert(data: List<T>)
 | `heartbeatPeriod` | Int | 心跳周期（秒） |
 | `deviceNumber` | String | 设备编号 |
 | `batchSize` | Int | 批量大小 |
+| `syncMode` | Int | 同步模式（0-ID单查，1-批量） |
 
 #### 方法
 
@@ -812,42 +851,50 @@ fun saveSuccessfulSyncTime(time: String)
 fun getAllTask(): List<SyncTaskDefinition>
 ```
 
-### SyncLogger
+### ILibLogger
 
-日志记录器。
+日志接口，用于记录同步过程中的详细信息。
 
 #### 方法
 
-##### `info`
+##### `v` / `d` / `i` / `w` / `e`
 
-记录信息级别日志。
+记录不同级别的日志。
 
 ```kotlin
-suspend fun info(message: String)
+fun v(tag: String, msg: String)
+fun d(tag: String, msg: String)
+fun i(tag: String, msg: String)
+fun w(tag: String, msg: String)
+fun e(tag: String, msg: String, tr: Throwable?)
 ```
 
-##### `warn`
+##### `logOperation`
 
-记录警告级别日志。
+记录操作日志。
 
 ```kotlin
-suspend fun warn(message: String)
+fun logOperation(tag: String, type: String, result: String, params: Map<String, Any?>)
 ```
 
-##### `error`
+#### 扩展函数
 
-记录错误级别日志。
-
-```kotlin
-suspend fun error(message: String)
-```
-
-##### `setSessionId`
-
-设置会话 ID。
+库提供了便捷的扩展函数，使用时无需手动传递 tag：
 
 ```kotlin
-fun setSessionId(sessionId: String)
+// 基础日志
+libLogD("调试信息")
+libLogI("普通信息")
+libLogW("警告信息")
+libLogE("错误信息", exception)
+
+// 操作日志
+libLogOpStart("数据同步", params = mapOf("id" to 123))
+libLogOpSuccess("数据同步", params = mapOf("count" to 10))
+libLogOpFail("数据同步", error = "网络错误")
+
+// 惰性日志（避免不必要的字符串拼接）
+libLogDLazy(tag) { "耗时: ${calculateExpensiveValue()}ms" }
 ```
 
 ---
@@ -881,6 +928,9 @@ class MySyncConfigProvider : SyncConfigProvider {
     // 批量大小，用于分批获取数据
     override var batchSize: Int = 50
 
+    // 同步模式：0-ID单查，1-批量（推荐）
+    override var syncMode: Int = 1
+
     override fun saveSuccessfulSyncTime(time: String) {
         syncDataTime = time
     }
@@ -902,34 +952,41 @@ class MySyncConfigProvider : SyncConfigProvider {
 
 ### 日志配置
 
-初始化日志系统：
+初始化日志系统（推荐在 Application 的 onCreate 中初始化）：
 
 ```kotlin
-LibLogManager.init(object : ILibLogger {
-    override fun v(tag: String, msg: String) {
-        Log.v(tag, msg)
-    }
+class MyApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
 
-    override fun d(tag: String, msg: String) {
-        Log.d(tag, msg)
-    }
+        // 初始化日志系统
+        LibLogManager.init(object : ILibLogger {
+            override fun v(tag: String, msg: String) {
+                Log.v(tag, msg)
+            }
 
-    override fun i(tag: String, msg: String) {
-        Log.i(tag, msg)
-    }
+            override fun d(tag: String, msg: String) {
+                Log.d(tag, msg)
+            }
 
-    override fun w(tag: String, msg: String) {
-        Log.w(tag, msg)
-    }
+            override fun i(tag: String, msg: String) {
+                Log.i(tag, msg)
+            }
 
-    override fun e(tag: String, msg: String, tr: Throwable?) {
-        Log.e(tag, msg, tr)
-    }
+            override fun w(tag: String, msg: String) {
+                Log.w(tag, msg)
+            }
 
-    override fun logOperation(tag: String, type: String, result: String, params: Map<String, Any?>) {
-        Log.i(tag, "$type: $result, params: $params")
+            override fun e(tag: String, msg: String, tr: Throwable?) {
+                Log.e(tag, msg, tr)
+            }
+
+            override fun logOperation(tag: String, type: String, result: String, params: Map<String, Any?>) {
+                Log.i(tag, "$type: $result, params: $params")
+            }
+        })
     }
-})
+}
 ```
 
 ### WorkManager 配置
@@ -1016,7 +1073,6 @@ class UserSyncWorker(
     context: Context,
     workerParameters: WorkerParameters,
     private val repository: UserRepository,
-    private val logger: SyncLogger,
     private val syncConfig: SyncConfigProvider,
     private val fileService: FileService
 ) : BaseCompareWork<User, UserRepository>(context, workerParameters) {
@@ -1026,12 +1082,10 @@ class UserSyncWorker(
     override val syncOptionName: String = "用户数据"
     override val repository: UserRepository = this.repository
     override val syncOptionInt: Int = 2 // TWO_WAY_SYNC
-    override val logger: SyncLogger = this.logger
     override val syncConfig: SyncConfigProvider = this.syncConfig
 
     override suspend fun handleLocalDataForUpload(
         data: User,
-        logger: SyncLogger,
         failureMessages: MutableList<String>,
         onLocalUpdate: (User) -> Unit,
         onRemoteUpdate: (User) -> Unit
@@ -1040,10 +1094,10 @@ class UserSyncWorker(
         data.photoPath?.let { path ->
             try {
                 val remoteUrl = fileService.uploadFile(path)
-                logger.info("头像上传成功: $remoteUrl")
+                libLogI("头像上传成功: $remoteUrl")
                 return data.copy(photoUrl = remoteUrl)
             } catch (e: Exception) {
-                logger.error("头像上传失败: ${e.message}")
+                libLogE("头像上传失败: ${e.message}", e)
                 failureMessages.add("头像上传失败")
                 return null
             }
@@ -1053,7 +1107,6 @@ class UserSyncWorker(
 
     override suspend fun handleRemoteDataForDownload(
         data: User,
-        logger: SyncLogger,
         failureMessages: MutableList<String>,
         onLocalUpdate: (User) -> Unit,
         onRemoteUpdate: (User) -> Unit
@@ -1062,10 +1115,10 @@ class UserSyncWorker(
         data.photoUrl?.let { url ->
             try {
                 val localPath = fileService.downloadFile(url)
-                logger.info("头像下载成功: $localPath")
+                libLogI("头像下载成功: $localPath")
                 return data.copy(photoPath = localPath)
             } catch (e: Exception) {
-                logger.error("头像下载失败: ${e.message}")
+                libLogE("头像下载失败: ${e.message}", e)
                 failureMessages.add("头像下载失败")
                 return null
             }
@@ -1108,7 +1161,6 @@ class OrderSyncWorker(
     context: Context,
     workerParameters: WorkerParameters,
     private val repository: OrderRepository,
-    private val logger: SyncLogger,
     private val syncConfig: SyncConfigProvider
 ) : BaseCompareWork<Order, OrderRepository>(context, workerParameters) {
 
@@ -1117,7 +1169,6 @@ class OrderSyncWorker(
     override val syncOptionName: String = "订单数据"
     override val repository: OrderRepository = this.repository
     override val syncOptionInt: Int = 0 // DEVICE_UPLOAD
-    override val logger: SyncLogger = this.logger
     override val syncConfig: SyncConfigProvider = this.syncConfig
 }
 ```
@@ -1129,7 +1180,6 @@ class ConfigSyncWorker(
     context: Context,
     workerParameters: WorkerParameters,
     private val repository: ConfigRepository,
-    private val logger: SyncLogger,
     private val syncConfig: SyncConfigProvider
 ) : BaseCompareWork<Config, ConfigRepository>(context, workerParameters) {
 
@@ -1138,64 +1188,41 @@ class ConfigSyncWorker(
     override val syncOptionName: String = "配置数据"
     override val repository: ConfigRepository = this.repository
     override val syncOptionInt: Int = 1 // SERVER_DOWNLOAD
-    override val logger: SyncLogger = this.logger
     override val syncConfig: SyncConfigProvider = this.syncConfig
 }
 ```
 
-### 示例 4：查看同步日志
+### 示例 4：使用自定义日志实现
 
-使用 Jetpack Compose 查看同步日志：
+实现 `ILibLogger` 接口，将日志输出到文件或网络：
 
 ```kotlin
-@Composable
-fun SyncLogScreen(viewModel: SyncLogViewModel = viewModel()) {
-    val logs by viewModel.logs.collectAsLazyPagingItems()
+class FileLogger(
+    private val context: Context
+) : ILibLogger {
+    private val logFile = File(context.filesDir, "sync_logs.txt")
 
-    LazyColumn {
-        items(logs) { log ->
-            LogItem(log)
-        }
+    override fun i(tag: String, msg: String) {
+        writeToLog("INFO", tag, msg)
+    }
+
+    override fun e(tag: String, msg: String, tr: Throwable?) {
+        val errorMsg = if (tr != null) "$msg\n${Log.getStackTraceString(tr)}" else msg
+        writeToLog("ERROR", tag, errorMsg)
+    }
+
+    // ... 其他方法
+
+    private fun writeToLog(level: String, tag: String, msg: String) {
+        val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
+            .format(Date())
+        val logLine = "[$timestamp] [$level] [$tag] $msg\n"
+        logFile.appendText(logLine)
     }
 }
 
-@Composable
-fun LogItem(log: SyncLog) {
-    val backgroundColor = when (log.logLevel) {
-        "INFO" -> Color(0xFFE3F2FD)
-        "WARN" -> Color(0xFFFFF3E0)
-        "ERROR" -> Color(0xFFFFEBEE)
-        else -> Color.White
-    }
-
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(8.dp),
-        backgroundColor = backgroundColor
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp)
-        ) {
-            Text(
-                text = log.workerName,
-                style = MaterialTheme.typography.subtitle1,
-                fontWeight = FontWeight.Bold
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = log.message,
-                style = MaterialTheme.typography.body2
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = log.timestamp,
-                style = MaterialTheme.typography.caption,
-                color = Color.Gray
-            )
-        }
-    }
-}
+// 初始化
+LibLogManager.init(FileLogger(applicationContext))
 ```
 
 ---
@@ -1253,29 +1280,17 @@ override suspend fun remoteGetById(id: Long): ResultModel<T> {
 - 处理文件上传/下载失败的情况
 - 考虑文件大小和网络状况
 
-### 6. 日志清理
+### 6. 同步模式选择
 
-定期清理过期日志，避免占用过多存储空间：
+根据实际场景选择合适的同步模式：
 
-```kotlin
-class ClearOldLogsWorker(
-    context: Context,
-    workerParams: WorkerParameters,
-    private val syncLogDao: SyncLogDao
-) : CoroutineWorker(context, workerParams) {
-
-    override suspend fun doWork(): Result {
-        val daysToKeep = 7
-        val cutoffDate = SimpleDateFormat(
-            "yyyy-MM-dd HH:mm:ss",
-            Locale.getDefault()
-        ).format(Date(System.currentTimeMillis() - daysToKeep * 24 * 60 * 60 * 1000))
-
-        syncLogDao.deleteLogsBefore(cutoffDate)
-        return Result.success()
-    }
-}
-```
+- **批量模式** (syncMode = 1)：推荐使用，性能更好，减少网络请求次数
+  - 实现批量查询接口：`remoteGetAfterUpdateTimeBatch` 和 `localGetAfterUpdateTimeBatch`
+  - 适用于数据量较大的场景
+  
+- **ID 单查模式** (syncMode = 0)：传统模式，先获取 ID 列表，再逐个查询详情
+  - 已标记为 Deprecated，将在后续版本移除
+  - 适用于数据量较小的场景
 
 ### 7. 心跳机制
 
@@ -1330,18 +1345,39 @@ if (syncConfigProvider.username.isEmpty()) {
 
 ### Q2: 如何查看同步日志？
 
-**A:** 使用 `SyncLogDao` 查询日志：
+**A:** 库采用依赖注入的日志系统，日志输出由应用层实现 `ILibLogger` 接口控制。常见方式包括：
 
-```kotlin
-// 查询所有日志
-val allLogs = syncLogDao.getAllLogs()
+1. **输出到 Logcat**：
+   ```kotlin
+   LibLogManager.init(object : ILibLogger {
+       override fun i(tag: String, msg: String) {
+           Log.i(tag, msg)
+       }
+       // ... 其他方法
+   })
+   ```
 
-// 按会话 ID 查询
-val sessionLogs = syncLogDao.getLogsBySessionId(sessionId)
+2. **输出到文件**：
+   ```kotlin
+   class FileLogger : ILibLogger {
+       private val logFile = File(context.filesDir, "sync_logs.txt")
+       
+       override fun i(tag: String, msg: String) {
+           logFile.appendText("[INFO] $tag: $msg\n")
+       }
+       // ... 其他方法
+   }
+   ```
 
-// 按日志级别查询
-val errorLogs = syncLogDao.getLogsByLevel("ERROR")
-```
+3. **输出到网络服务器**：
+   ```kotlin
+   class NetworkLogger : ILibLogger {
+       override fun e(tag: String, msg: String, tr: Throwable?) {
+           sendToServer(tag, msg, tr)
+       }
+       // ... 其他方法
+   }
+   ```
 
 ### Q3: 双向同步时如何解决冲突？
 
@@ -1360,7 +1396,6 @@ val errorLogs = syncLogDao.getLogsByLevel("ERROR")
 ```kotlin
 override suspend fun handleLocalDataForUpload(
     data: T,
-    logger: SyncLogger,
     failureMessages: MutableList<String>,
     onLocalUpdate: (T) -> Unit,
     onRemoteUpdate: (T) -> Unit
@@ -1377,11 +1412,12 @@ override suspend fun handleLocalDataForUpload(
 
 **A:** 以下是一些优化建议：
 
-1. 调整 `batchSize` 参数
-2. 使用并发处理
-3. 减少不必要的数据传输
-4. 压缩上传的数据
-5. 使用增量同步
+1. 使用批量同步模式（syncMode = 1），减少网络请求次数
+2. 调整 `batchSize` 参数
+3. 使用并发处理
+4. 减少不必要的数据传输
+5. 压缩上传的数据
+6. 使用增量同步
 
 ### Q6: 同步失败后如何重试？
 
@@ -1448,6 +1484,7 @@ override var batchSize: Int = 100 // 设置合适的批量大小
 | 版本 | 日期 | 说明 |
 |------|------|------|
 | 1.0.7 | 2025-01-21 | 初始版本发布 |
+| 1.0.8 | 2025-01-26 | 重构日志系统，采用依赖注入方式；新增批量同步模式；优化同步性能 |
 
 ### 依赖版本
 
@@ -1550,4 +1587,4 @@ override var batchSize: Int = 100 // 设置合适的批量大小
 
 ---
 
-**最后更新时间：2025-01-21**
+**最后更新时间：2025-01-26**
