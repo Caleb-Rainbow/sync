@@ -72,3 +72,40 @@ fun Any.libLogOpFail(type: String, error: String, params: Map<String, Any?> = em
     // 失败时，我们将错误信息合并到 params 或者 result 中传出去
     LibLogManager.logger.logOperation(this.LIB_TAG, type, "失败 | 错误:$error", params)
 }
+
+// ===========================================
+// 4. 惰性求值日志扩展 (避免不必要的字符串拼接开销)
+// ===========================================
+
+/**
+ * 惰性日志扩展函数 - 使用缓存的 TAG
+ * 适用于高频调用场景，避免每次都通过反射获取类名
+ * 
+ * @param tag 预先缓存的 TAG 字符串
+ * @param lazyMsg 延迟构建的日志消息
+ */
+inline fun libLogDLazy(tag: String, lazyMsg: () -> String) {
+    LibLogManager.logger.d(tag, lazyMsg())
+}
+
+inline fun libLogILazy(tag: String, lazyMsg: () -> String) {
+    LibLogManager.logger.i(tag, lazyMsg())
+}
+
+inline fun libLogWLazy(tag: String, lazyMsg: () -> String) {
+    LibLogManager.logger.w(tag, lazyMsg())
+}
+
+inline fun libLogELazy(tag: String, lazyMsg: () -> String) {
+    LibLogManager.logger.e(tag, lazyMsg(), null)
+}
+
+inline fun libLogVLazy(tag: String, lazyMsg: () -> String) {
+    LibLogManager.logger.v(tag, lazyMsg())
+}
+
+/**
+ * 获取类名的扩展属性（供外部缓存使用）
+ */
+val Any.libLogTag: String
+    get() = this.LIB_TAG

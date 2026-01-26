@@ -6,8 +6,10 @@ import androidx.work.Data
 import androidx.work.WorkerParameters
 import com.github.yitter.idgen.YitIdHelper
 import com.util.sync.log.libLogD
+import com.util.sync.log.libLogDLazy
 import com.util.sync.log.libLogE
 import com.util.sync.log.libLogI
+import com.util.sync.log.libLogTag
 import com.util.sync.log.libLogW
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -29,6 +31,17 @@ const val KEY_LAST_SYNC_TIME = "KEY_LAST_SYNC_TIME"
 const val KEY_SYNC_START_TIME = "KEY_SYNC_START_TIME"
 const val KEY_SYNC_SESSION_ID = "KEY_SYNC_SESSION_ID"
 
+/**
+ * 同步统计数据类
+ * 使用可变属性替代 Map，避免频繁的 getOrDefault 开销
+ */
+data class SyncStats(
+    var downloaded: Int = 0,
+    var uploaded: Int = 0,
+    var skipped: Int = 0,
+    var failedFetch: Int = 0
+)
+
 abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
     context: Context,
     workerParameters: WorkerParameters,
@@ -49,6 +62,9 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
     private val dateFormat by lazy {
         SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
     }
+
+    // 缓存 TAG，避免每次日志调用时通过反射获取类名
+    private val cachedTag: String by lazy { this.libLogTag }
 
     private fun formatTimestamp(timeMs: Long): String = dateFormat.format(Date(timeMs))
 
@@ -132,402 +148,480 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                 return@withContext Result.success(createSuccessData("同步已关闭，未执行任何操作。"))
             }
 
-            val failureMessages = mutableListOf<String>()
-            // 创建一个 Map 来追踪上传成功后需要删除的本地文件
-            val filesToDeleteAfterSuccess = mutableMapOf<Long, String>()
-            // 用于统计操作摘要
-            val summaryStats = mutableMapOf(
-                "downloaded" to 0,
-                "uploaded" to 0,
-                "skipped" to 0,
-                "failed_fetch" to 0
-            )
+            // 根据 syncMode 选择同步策略
+            val syncMode = syncConfig.syncMode
+            libLogI("📍 同步策略: ${if (syncMode == 1) "批量模式" else "ID单查模式"}")
+            libLogI("────────────────────────────────────────────────────────")
 
-            // 定义一个数据类来封装每个 ID 的获取结果
-            data class FetchedData(val id: Long, val local: T?, val remote: T?, val error: String? = null)
-
-            // 处理上传成功后需要删除的本地文件
-            fun handleFilesToDelete(processed: SyncableEntity, data: SyncableEntity) {
-                if (!processed.getPhotoPath().isNullOrEmpty() && processed.getPhotoPath() != data.getPhotoPath()) {
-                    data.getPhotoPath()?.let { p ->
-                        filesToDeleteAfterSuccess[data.id] = p
-                    }
-                }
-            }
-
-            try {
-                var remoteIds: List<Long> = emptyList()
-                var localIds: List<Long> = emptyList()
-
-                // ═══════════════════════════════════════════════════════════
-                // 步骤 1: 获取需要同步的 ID 列表
-                // ═══════════════════════════════════════════════════════════
-                libLogI("📥 步骤 1: 获取待同步 ID 列表")
-
-                if (syncOption == SyncOption.SERVER_DOWNLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
-                    libLogI("  ⬇️ 正在获取服务端更新列表...")
-                    val fetchStartTime = System.currentTimeMillis()
-                    
-                    val remoteIdsResult = repository.remoteGetAfterUpdateTime(lastSyncTime)
-                    val fetchDuration = System.currentTimeMillis() - fetchStartTime
-                    
-                    if (remoteIdsResult.isError()) {
-                        libLogE("  ❌ 获取服务端 ID 列表失败")
-                        libLogE("    错误码: ${remoteIdsResult.code}")
-                        libLogE("    错误信息: ${remoteIdsResult.message}")
-                        libLogE("    请求耗时: ${fetchDuration}ms")
-                        failureMessages.add("获取服务端 $syncOptionName ID列表失败: 错误码->${remoteIdsResult.code} ${remoteIdsResult.message}")
-                    } else {
-                        remoteIds = remoteIdsResult.data ?: emptyList()
-                        libLogI("  ✅ 服务端更新列表获取成功")
-                        libLogI("    数量: ${remoteIds.size} 个")
-                        libLogI("    请求耗时: ${fetchDuration}ms")
-                        if (remoteIds.isNotEmpty()) {
-                            libLogD("    ID 列表: ${remoteIds.toLogString()}")
-                        }
-                    }
-                }
-
-                if (syncOption == SyncOption.DEVICE_UPLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
-                    libLogI("  ⬆️ 正在获取本地更新列表...")
-                    val fetchStartTime = System.currentTimeMillis()
-                    
-                    localIds = repository.localGetAfterUpdateTime(lastSyncTime)
-                    val fetchDuration = System.currentTimeMillis() - fetchStartTime
-                    
-                    libLogI("  ✅ 本地更新列表获取成功")
-                    libLogI("    数量: ${localIds.size} 个")
-                    libLogI("    查询耗时: ${fetchDuration}ms")
-                    if (localIds.isNotEmpty()) {
-                        libLogD("    ID 列表: ${localIds.toLogString()}")
-                    }
-                }
-
-                val allIds = (remoteIds + localIds).distinct()
-                libLogI("  � 汇总: 共 ${allIds.size} 个待处理项目 (去重后)")
-                if (allIds.isNotEmpty()) {
-                    libLogD("    完整 ID 列表: ${allIds.toLogString(20)}")
-                }
-                libLogI("────────────────────────────────────────────────────────")
-
-                // 无待同步项目，提前结束
-                if (allIds.isEmpty()) {
-                    val endTime = System.currentTimeMillis()
-                    val duration = endTime - startTime
-
-                    if (failureMessages.isNotEmpty()) {
-                        libLogE("⚠️ 任务完成但存在错误")
-                        libLogE("  错误数量: ${failureMessages.size}")
-                        failureMessages.forEachIndexed { index, msg ->
-                            libLogE("  [${index + 1}] $msg")
-                        }
-                        libLogI("  总耗时: ${duration}ms")
-                        libLogI("────────────────────────────────────────────────────────")
-                        return@withContext Result.failure(createFailData(failureMessages.joinToString("\n")))
-                    }
-
-                    libLogI("✅ 没有需要同步的项目，任务提前完成")
-                    libLogI("  总耗时: ${duration}ms")
-                    libLogI("────────────────────────────────────────────────────────")
-                    return@withContext Result.success(createSuccessData("没有需要同步的$syncOptionName"))
-                }
-
-                // ═══════════════════════════════════════════════════════════
-                // 步骤 2: 分批并发获取所有项目的详细数据
-                // ═══════════════════════════════════════════════════════════
-                val batchSize = syncConfig.batchSize
-                val totalBatches = (allIds.size + batchSize - 1) / batchSize
-                
-                libLogI("📦 步骤 2: 分批获取项目详情")
-                libLogI("  批量大小: $batchSize")
-                libLogI("  总批次数: $totalBatches")
-                
-                val fetchDetailStartTime = System.currentTimeMillis()
-                
-                val allFetchedData = allIds.chunked(batchSize).flatMapIndexed { batchIndex, batchIds ->
-                    libLogD("  正在处理批次 ${batchIndex + 1}/$totalBatches (${batchIds.size} 项)...")
-                    
-                    // 对每个批次，并发获取数据
-                    batchIds.map { itemId ->
-                        async { // 为每个 ID 启动一个 async 协程
-                            try {
-                                val remoteDataResult = if (syncOption == SyncOption.SERVER_DOWNLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
-                                    repository.remoteGetById(itemId)
-                                } else null
-
-                                // 如果获取远程数据失败，记录下来但不要中断整个流程
-                                if (remoteDataResult?.isError() == true) {
-                                    libLogE("    ❌ 获取远程数据失败 (ID: $itemId)")
-                                    libLogE("      错误: ${remoteDataResult.message}")
-                                    failureMessages.add("获取服务端 $syncOptionName (ID: $itemId) 的详细信息失败: ${remoteDataResult.message}")
-                                    return@async FetchedData(id = itemId, local = null, remote = null, error = remoteDataResult.message)
-                                }
-
-                                val localData = if (syncOption == SyncOption.DEVICE_UPLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
-                                    repository.localGetById(itemId)
-                                } else null
-
-                                FetchedData(id = itemId, local = localData, remote = remoteDataResult?.data)
-                            } catch (e: Exception) {
-                                libLogE("    💥 获取数据异常 (ID: $itemId)")
-                                libLogE("      异常: ${e.message}")
-                                failureMessages.add("获取 ID $itemId 数据时发生意外异常: ${e.message}")
-                                FetchedData(id = itemId, local = null, remote = null, error = e.message)
-                            }
-                        }
-                    }.awaitAll() // 等待当前批次的所有任务完成
-                }
-                
-                val fetchDetailDuration = System.currentTimeMillis() - fetchDetailStartTime
-                libLogI("  ✅ 数据获取完成，耗时: ${fetchDetailDuration}ms")
-                libLogI("────────────────────────────────────────────────────────")
-
-                // ═══════════════════════════════════════════════════════════
-                // 步骤 3: 集中处理所有已获取的数据
-                // ═══════════════════════════════════════════════════════════
-                libLogI("⚙️ 步骤 3: 数据比对与处理")
-                
-                val updatedLocalData = mutableListOf<T>()
-                val updatedRemoteData = mutableListOf<T>()
-
-                for (fetched in allFetchedData) {
-                    // 跳过在获取阶段就失败的项目
-                    if (fetched.error != null) {
-                        summaryStats["failed_fetch"] = summaryStats.getOrDefault("failed_fetch", 0) + 1
-                        continue
-                    }
-
-                    val localData = fetched.local
-                    val remoteData = fetched.remote
-                    val itemId = fetched.id
-
-                    // 详细记录决策逻辑
-                    when (syncOption) {
-                        SyncOption.DEVICE_UPLOAD -> localData?.let {
-                            libLogD("  📤 [ID: $itemId] 模式: 仅上传")
-                            val processed = handleLocalDataForUpload(it, failureMessages)
-                            processed?.let { element ->
-                                updatedRemoteData.add(element)
-                                if (element != it) {
-                                    updatedLocalData.add(element)
-                                    handleFilesToDelete(element, it)
-                                }
-                            }
-                            summaryStats["uploaded"] = summaryStats.getOrDefault("uploaded", 0) + 1
-                        }
-
-                        SyncOption.SERVER_DOWNLOAD -> remoteData?.let {
-                            libLogD("  📥 [ID: $itemId] 模式: 仅下载")
-                            val processed = handleRemoteDataForDownload(it, failureMessages)
-                            processed?.let { element ->
-                                updatedLocalData.add(element)
-                            }
-                            summaryStats["downloaded"] = summaryStats.getOrDefault("downloaded", 0) + 1
-                        }
-
-                        SyncOption.TWO_WAY_SYNC -> when {
-                            remoteData == null && localData != null -> {
-                                libLogD("  📤 [ID: $itemId] 双向同步: 服务端无此数据，执行上传")
-                                val processed = handleLocalDataForUpload(localData, failureMessages)
-                                processed?.let {
-                                    updatedRemoteData.add(it)
-                                    if (it != localData) {
-                                        updatedLocalData.add(it)
-                                        handleFilesToDelete(it, localData)
-                                    }
-                                }
-                                summaryStats["uploaded"] = summaryStats.getOrDefault("uploaded", 0) + 1
-                            }
-
-                            remoteData != null && localData == null -> {
-                                libLogD("  📥 [ID: $itemId] 双向同步: 本地无此数据，执行下载")
-                                val processed = handleRemoteDataForDownload(remoteData, failureMessages)
-                                processed?.let {
-                                    updatedLocalData.add(it)
-                                    if (it != remoteData) {
-                                        updatedRemoteData.add(it)
-                                        handleFilesToDelete(it, remoteData)
-                                    }
-                                }
-                                summaryStats["downloaded"] = summaryStats.getOrDefault("downloaded", 0) + 1
-                            }
-
-                            remoteData != null && localData != null -> {
-                                libLogD("  🔀 [ID: $itemId] 双向同步: 冲突解决")
-                                libLogD("    服务端时间: ${remoteData.updateTime}")
-                                libLogD("    本地时间: ${localData.updateTime}")
-                                
-                                when {
-                                    remoteData.updateTime > localData.updateTime -> {
-                                        libLogD("    决策: 服务端较新 → 下载")
-                                        val processed = handleRemoteDataForDownload(remoteData, failureMessages)
-                                        processed?.let {
-                                            updatedLocalData.add(it)
-                                            if (processed != remoteData) updatedRemoteData.add(it)
-                                        }
-                                        summaryStats["downloaded"] = summaryStats.getOrDefault("downloaded", 0) + 1
-                                    }
-
-                                    localData.updateTime > remoteData.updateTime -> {
-                                        libLogD("    决策: 本地较新 → 上传")
-                                        val processed = handleLocalDataForUpload(localData, failureMessages)
-                                        processed?.let {
-                                            updatedRemoteData.add(it)
-                                            if (it != localData) {
-                                                updatedLocalData.add(it)
-                                                handleFilesToDelete(it, localData)
-                                            }
-                                        }
-                                        summaryStats["uploaded"] = summaryStats.getOrDefault("uploaded", 0) + 1
-                                    }
-
-                                    else -> {
-                                        libLogD("    决策: 时间相同 → 跳过")
-                                        summaryStats["skipped"] = summaryStats.getOrDefault("skipped", 0) + 1
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                libLogI("  ✅ 数据处理完成")
-                libLogI("  待上传: ${updatedRemoteData.size} 项")
-                libLogI("  待更新本地: ${updatedLocalData.size} 项")
-                libLogI("────────────────────────────────────────────────────────")
-
-                // ═══════════════════════════════════════════════════════════
-                // 步骤 4: 批量更新
-                // ═══════════════════════════════════════════════════════════
-                libLogI("💾 步骤 4: 批量数据更新")
-                
-                // 上传到服务器
-                if (updatedRemoteData.isNotEmpty()) {
-                    val idsToUpdate = updatedRemoteData.map { it.id }.toLogString()
-                    libLogI("  ☁️ 正在上传 ${updatedRemoteData.size} 个项目到服务器...")
-                    libLogD("    ID 列表: $idsToUpdate")
-                    
-                    val uploadStartTime = System.currentTimeMillis()
-                    val remotePutResult = repository.remoteBatchUpsert(updatedRemoteData)
-                    val uploadDuration = System.currentTimeMillis() - uploadStartTime
-                    
-                    if (remotePutResult.isError()) {
-                        libLogE("  ❌ 批量上传失败!")
-                        libLogE("    错误码: ${remotePutResult.code}")
-                        libLogE("    错误信息: ${remotePutResult.message}")
-                        libLogE("    请求耗时: ${uploadDuration}ms")
-                        failureMessages.add("批量上传到服务器失败: 错误码->${remotePutResult.code} ${remotePutResult.message}")
-                    } else {
-                        libLogI("  ✅ 批量上传成功")
-                        libLogI("    上传数量: ${updatedRemoteData.size}")
-                        libLogI("    请求耗时: ${uploadDuration}ms")
-                        
-                        // 仅在批量上传成功后，才执行文件删除操作
-                        if (syncConfig.isDeleteLocalFile && filesToDeleteAfterSuccess.isNotEmpty()) {
-                            libLogI("  🗑️ 正在清理已上传的本地文件...")
-                            var deletedCount = 0
-                            var failedCount = 0
-                            
-                            updatedRemoteData.forEach { updatedItem ->
-                                filesToDeleteAfterSuccess[updatedItem.id]?.let { localPath ->
-                                    try {
-                                        val fileToDelete = File(localPath)
-                                        if (fileToDelete.exists()) {
-                                            if (fileToDelete.delete()) {
-                                                libLogD("    ✓ 已删除: $localPath")
-                                                deletedCount++
-                                            } else {
-                                                libLogW("    ✗ 删除失败: $localPath")
-                                                failedCount++
-                                            }
-                                        }
-                                    } catch (e: SecurityException) {
-                                        libLogE("    💥 删除异常: $localPath")
-                                        libLogE("      错误: ${e.message}")
-                                        failedCount++
-                                    }
-                                }
-                            }
-                            libLogI("    文件清理完成: 成功 $deletedCount, 失败 $failedCount")
-                        }
-                    }
-                }
-
-                // 更新本地数据库
-                if (updatedLocalData.isNotEmpty()) {
-                    val idsToUpdate = updatedLocalData.map { it.id }.toLogString()
-                    libLogI("  🗄️ 正在更新本地数据库 ${updatedLocalData.size} 个项目...")
-                    libLogD("    ID 列表: $idsToUpdate")
-                    
-                    val localUpdateStartTime = System.currentTimeMillis()
-                    repository.localBatchUpsert(updatedLocalData)
-                    val localUpdateDuration = System.currentTimeMillis() - localUpdateStartTime
-                    
-                    libLogI("  ✅ 本地更新成功")
-                    libLogI("    更新数量: ${updatedLocalData.size}")
-                    libLogI("    操作耗时: ${localUpdateDuration}ms")
-                }
-                
-                libLogI("────────────────────────────────────────────────────────")
-
-                // ═══════════════════════════════════════════════════════════
-                // 步骤 5: 任务完成总结
-                // ═══════════════════════════════════════════════════════════
-                val endTime = System.currentTimeMillis()
-                val duration = endTime - startTime
-
-                // 超时警告
-                if (duration > TIMEOUT_THRESHOLD_MS) {
-                    libLogW("⏱️ 警告: 任务耗时超过5分钟!")
-                    libLogW("  实际耗时: ${duration}ms (${duration / 1000}s)")
-                    libLogW("  请检查网络状况或数据量是否过大")
-                }
-
-                libLogI("════════════════════════════════════════════════════════")
-                libLogI("📊 同步任务完成: $workChineseName")
-                libLogI("════════════════════════════════════════════════════════")
-                libLogI("📈 操作统计:")
-                libLogI("  下载: ${summaryStats["downloaded"]} 项")
-                libLogI("  上传: ${summaryStats["uploaded"]} 项")
-                libLogI("  跳过: ${summaryStats["skipped"]} 项")
-                if (summaryStats["failed_fetch"]!! > 0) {
-                    libLogW("  获取失败: ${summaryStats["failed_fetch"]} 项")
-                }
-                libLogI("⏱️ 时间统计:")
-                libLogI("  总耗时: ${duration}ms")
-                libLogI("  结束时间: ${formatTimestamp(endTime)}")
-
-                if (failureMessages.isEmpty()) {
-                    libLogI("✅ 任务状态: 成功")
-                    libLogI("════════════════════════════════════════════════════════")
-                    Result.success(createSuccessData("${syncOptionName}增量更新成功，耗时${duration}ms"))
-                } else {
-                    libLogE("❌ 任务状态: 部分失败")
-                    libLogE("  错误数量: ${failureMessages.size}")
-                    failureMessages.forEachIndexed { index, msg ->
-                        libLogE("  [${index + 1}] $msg")
-                    }
-                    libLogI("════════════════════════════════════════════════════════")
-                    Result.failure(createFailData(failureMessages.joinToString("\n")))
-                }
-            } catch (e: Exception) {
-                val endTime = System.currentTimeMillis()
-                val duration = endTime - startTime
-                
-                libLogE("════════════════════════════════════════════════════════")
-                libLogE("💥 同步任务发生未捕获异常: $workChineseName")
-                libLogE("════════════════════════════════════════════════════════")
-                libLogE("异常类型: ${e.javaClass.simpleName}")
-                libLogE("异常信息: ${e.message}")
-                libLogE("任务耗时: ${duration}ms")
-                libLogE("堆栈信息:")
-                libLogE(e.stackTraceToString())
-                libLogE("════════════════════════════════════════════════════════")
-                
-                failureMessages.add("发生意外错误: ${e.message}")
-                return@withContext Result.failure(createFailData(failureMessages.joinToString("\n")))
+            return@withContext if (syncMode == 1) {
+                executeBatchMode(startTime, sessionId, lastSyncTime, syncOption)
+            } else {
+                executeIdQueryMode(startTime, sessionId, lastSyncTime, syncOption)
             }
         }
+    }
+
+    /**
+     * 旧模式：ID 单查模式
+     * 先获取 ID 列表，然后逐个获取详情，最后批量更新
+     */
+    @Suppress("DEPRECATION")
+    private suspend fun executeIdQueryMode(
+        startTime: Long,
+        sessionId: String,
+        lastSyncTime: String,
+        syncOption: SyncOption
+    ): Result = withContext(Dispatchers.IO) {
+        val failureMessages = mutableListOf<String>()
+        val filesToDeleteAfterSuccess = mutableMapOf<Long, String>()
+        val stats = SyncStats()
+
+        data class FetchedData(val id: Long, val local: T?, val remote: T?, val error: String? = null)
+
+        try {
+            var remoteIds: List<Long> = emptyList()
+            var localIds: List<Long> = emptyList()
+
+            libLogI("📥 步骤 1: 获取待同步 ID 列表")
+
+            if (syncOption == SyncOption.SERVER_DOWNLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
+                libLogI("  ⬇️ 正在获取服务端更新列表...")
+                val fetchStartTime = System.currentTimeMillis()
+                val remoteIdsResult = repository.remoteGetAfterUpdateTime(lastSyncTime)
+                val fetchDuration = System.currentTimeMillis() - fetchStartTime
+
+                if (remoteIdsResult.isError()) {
+                    libLogE("  ❌ 获取服务端 ID 列表失败: ${remoteIdsResult.message}")
+                    failureMessages.add("获取服务端 ID列表失败: ${remoteIdsResult.message}")
+                } else {
+                    remoteIds = remoteIdsResult.data ?: emptyList()
+                    libLogI("  ✅ 服务端: ${remoteIds.size} 个，耗时: ${fetchDuration}ms")
+                }
+            }
+
+            if (syncOption == SyncOption.DEVICE_UPLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
+                libLogI("  ⬆️ 正在获取本地更新列表...")
+                val fetchStartTime = System.currentTimeMillis()
+                localIds = repository.localGetAfterUpdateTime(lastSyncTime)
+                val fetchDuration = System.currentTimeMillis() - fetchStartTime
+                libLogI("  ✅ 本地: ${localIds.size} 个，耗时: ${fetchDuration}ms")
+            }
+
+            val allIds = (remoteIds + localIds).distinct()
+            libLogI("  📋 汇总: 共 ${allIds.size} 个待处理项目")
+
+            if (allIds.isEmpty()) {
+                return@withContext if (failureMessages.isEmpty()) {
+                    Result.success(createSuccessData("没有需要同步的$syncOptionName"))
+                } else {
+                    Result.failure(createFailData(failureMessages.joinToString("\n")))
+                }
+            }
+
+            libLogI("📦 步骤 2: 分批获取项目详情")
+            val batchSize = syncConfig.batchSize
+            val fetchDetailStartTime = System.currentTimeMillis()
+
+            val allFetchedData = allIds.chunked(batchSize).flatMapIndexed { batchIndex, batchIds ->
+                batchIds.map { itemId ->
+                    async {
+                        try {
+                            val remoteDataResult = if (syncOption == SyncOption.SERVER_DOWNLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
+                                repository.remoteGetById(itemId)
+                            } else null
+
+                            if (remoteDataResult?.isError() == true) {
+                                failureMessages.add("获取远程数据失败 (ID: $itemId): ${remoteDataResult.message}")
+                                return@async FetchedData(id = itemId, local = null, remote = null, error = remoteDataResult.message)
+                            }
+
+                            val localData = if (syncOption == SyncOption.DEVICE_UPLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
+                                repository.localGetById(itemId)
+                            } else null
+
+                            FetchedData(id = itemId, local = localData, remote = remoteDataResult?.data)
+                        } catch (e: Exception) {
+                            failureMessages.add("获取数据异常 (ID: $itemId): ${e.message}")
+                            FetchedData(id = itemId, local = null, remote = null, error = e.message)
+                        }
+                    }
+                }.awaitAll()
+            }
+
+            libLogI("  ✅ 数据获取完成，耗时: ${System.currentTimeMillis() - fetchDetailStartTime}ms")
+
+            libLogI("⚙️ 步骤 3: 数据比对与处理")
+            val updatedLocalData = mutableListOf<T>()
+            val updatedRemoteData = mutableListOf<T>()
+
+            for (fetched in allFetchedData) {
+                if (fetched.error != null) {
+                    stats.failedFetch++
+                    continue
+                }
+                processDataComparison(
+                    fetched.local, fetched.remote, fetched.id, syncOption,
+                    failureMessages, stats, updatedLocalData, updatedRemoteData,
+                    filesToDeleteAfterSuccess
+                )
+            }
+
+            libLogI("  ✅ 待上传: ${updatedRemoteData.size} 项，待更新本地: ${updatedLocalData.size} 项")
+
+            performBatchUpdates(updatedRemoteData, updatedLocalData, failureMessages, filesToDeleteAfterSuccess)
+            
+            finalizeSyncResult(startTime, stats, failureMessages)
+        } catch (e: Exception) {
+            handleSyncException(e, startTime, failureMessages)
+        }
+    }
+
+    /**
+     * 新模式：批量模式
+     * 直接获取全部完整信息，在内存中比较差异，最后批量更新
+     * 性能更优，避免大量网络请求
+     */
+    private suspend fun executeBatchMode(
+        startTime: Long,
+        sessionId: String,
+        lastSyncTime: String,
+        syncOption: SyncOption
+    ): Result = withContext(Dispatchers.IO) {
+        val failureMessages = mutableListOf<String>()
+        val filesToDeleteAfterSuccess = mutableMapOf<Long, String>()
+        val stats = SyncStats()
+
+        try {
+            // ═══════════════════════════════════════════════════════════
+            // 步骤 1: 批量获取所有更新的完整信息
+            // ═══════════════════════════════════════════════════════════
+            libLogI("📥 步骤 1: 批量获取完整信息")
+
+            var remoteDataList: List<T> = emptyList()
+            var localDataList: List<T> = emptyList()
+
+            // 获取服务端更新数据
+            if (syncOption == SyncOption.SERVER_DOWNLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
+                libLogI("  ⬇️ 正在批量获取服务端更新数据...")
+                val fetchStartTime = System.currentTimeMillis()
+                val remoteResult = repository.remoteGetAfterUpdateTimeBatch(lastSyncTime)
+                val fetchDuration = System.currentTimeMillis() - fetchStartTime
+
+                if (remoteResult.isError()) {
+                    libLogE("  ❌ 批量获取服务端数据失败: ${remoteResult.message}")
+                    failureMessages.add("批量获取服务端数据失败: ${remoteResult.message}")
+                } else {
+                    remoteDataList = remoteResult.data ?: emptyList()
+                    libLogI("  ✅ 服务端数据获取成功")
+                    libLogI("    数量: ${remoteDataList.size} 个")
+                    libLogI("    请求耗时: ${fetchDuration}ms")
+                }
+            }
+
+            // 获取本地更新数据
+            if (syncOption == SyncOption.DEVICE_UPLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
+                libLogI("  ⬆️ 正在批量获取本地更新数据...")
+                val fetchStartTime = System.currentTimeMillis()
+                localDataList = repository.localGetAfterUpdateTimeBatch(lastSyncTime)
+                val fetchDuration = System.currentTimeMillis() - fetchStartTime
+
+                libLogI("  ✅ 本地数据获取成功")
+                libLogI("    数量: ${localDataList.size} 个")
+                libLogI("    查询耗时: ${fetchDuration}ms")
+            }
+
+            // 构建 ID -> 数据 的映射，便于快速查找
+            val remoteDataMap = remoteDataList.associateBy { it.id }
+            val localDataMap = localDataList.associateBy { it.id }
+            val allIds = (remoteDataMap.keys + localDataMap.keys).distinct()
+
+            libLogI("  📋 汇总: 共 ${allIds.size} 个待处理项目")
+            libLogI("    服务端: ${remoteDataMap.size} 个, 本地: ${localDataMap.size} 个")
+            libLogI("────────────────────────────────────────────────────────")
+
+            // 无待同步项目，提前结束
+            if (allIds.isEmpty()) {
+                val endTime = System.currentTimeMillis()
+                val duration = endTime - startTime
+
+                return@withContext if (failureMessages.isEmpty()) {
+                    libLogI("✅ 没有需要同步的项目，任务完成，耗时: ${duration}ms")
+                    Result.success(createSuccessData("没有需要同步的$syncOptionName"))
+                } else {
+                    libLogE("⚠️ 任务完成但存在错误: ${failureMessages.size} 个")
+                    Result.failure(createFailData(failureMessages.joinToString("\n")))
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // 步骤 2: 在内存中比较差异
+            // ═══════════════════════════════════════════════════════════
+            libLogI("⚙️ 步骤 2: 内存中数据比对")
+            val compareStartTime = System.currentTimeMillis()
+
+            val updatedLocalData = mutableListOf<T>()
+            val updatedRemoteData = mutableListOf<T>()
+
+            for (itemId in allIds) {
+                val localData = localDataMap[itemId]
+                val remoteData = remoteDataMap[itemId]
+
+                processDataComparison(
+                    localData, remoteData, itemId, syncOption,
+                    failureMessages, stats, updatedLocalData, updatedRemoteData,
+                    filesToDeleteAfterSuccess
+                )
+            }
+
+            val compareDuration = System.currentTimeMillis() - compareStartTime
+            libLogI("  ✅ 数据比对完成，耗时: ${compareDuration}ms")
+            libLogI("  待上传: ${updatedRemoteData.size} 项")
+            libLogI("  待更新本地: ${updatedLocalData.size} 项")
+            libLogI("────────────────────────────────────────────────────────")
+
+            // ═══════════════════════════════════════════════════════════
+            // 步骤 3: 批量更新
+            // ═══════════════════════════════════════════════════════════
+            performBatchUpdates(updatedRemoteData, updatedLocalData, failureMessages, filesToDeleteAfterSuccess)
+
+            finalizeSyncResult(startTime, stats, failureMessages)
+        } catch (e: Exception) {
+            handleSyncException(e, startTime, failureMessages)
+        }
+    }
+
+    /**
+     * 通用的数据比对处理逻辑
+     */
+    private suspend fun processDataComparison(
+        localData: T?,
+        remoteData: T?,
+        itemId: Long,
+        syncOption: SyncOption,
+        failureMessages: MutableList<String>,
+        stats: SyncStats,
+        updatedLocalData: MutableList<T>,
+        updatedRemoteData: MutableList<T>,
+        filesToDeleteAfterSuccess: MutableMap<Long, String>
+    ) {
+        // 内联文件删除逻辑，避免高阶函数调用开销
+        fun markFileForDeletion(processed: SyncableEntity, original: SyncableEntity) {
+            val processedPath = processed.getPhotoPath()
+            val originalPath = original.getPhotoPath()
+            if (!processedPath.isNullOrEmpty() && processedPath != originalPath) {
+                originalPath?.let { filesToDeleteAfterSuccess[original.id] = it }
+            }
+        }
+
+        when (syncOption) {
+            SyncOption.DEVICE_UPLOAD -> localData?.let {
+                libLogDLazy(cachedTag) { "  📤 [ID: $itemId] 模式: 仅上传" }
+                val processed = handleLocalDataForUpload(it, failureMessages)
+                processed?.let { element ->
+                    updatedRemoteData.add(element)
+                    if (element != it) {
+                        updatedLocalData.add(element)
+                        markFileForDeletion(element, it)
+                    }
+                }
+                stats.uploaded++
+            }
+
+            SyncOption.SERVER_DOWNLOAD -> remoteData?.let {
+                libLogDLazy(cachedTag) { "  📥 [ID: $itemId] 模式: 仅下载" }
+                val processed = handleRemoteDataForDownload(it, failureMessages)
+                processed?.let { element ->
+                    updatedLocalData.add(element)
+                }
+                stats.downloaded++
+            }
+
+            SyncOption.TWO_WAY_SYNC -> when {
+                remoteData == null && localData != null -> {
+                    libLogDLazy(cachedTag) { "  📤 [ID: $itemId] 双向同步: 服务端无此数据，执行上传" }
+                    val processed = handleLocalDataForUpload(localData, failureMessages)
+                    processed?.let {
+                        updatedRemoteData.add(it)
+                        if (it != localData) {
+                            updatedLocalData.add(it)
+                            markFileForDeletion(it, localData)
+                        }
+                    }
+                    stats.uploaded++
+                }
+
+                remoteData != null && localData == null -> {
+                    libLogDLazy(cachedTag) { "  📥 [ID: $itemId] 双向同步: 本地无此数据，执行下载" }
+                    val processed = handleRemoteDataForDownload(remoteData, failureMessages)
+                    processed?.let {
+                        updatedLocalData.add(it)
+                    }
+                    stats.downloaded++
+                }
+
+                remoteData != null && localData != null -> {
+                    libLogDLazy(cachedTag) { "  🔀 [ID: $itemId] 双向同步: 冲突解决" }
+                    when {
+                        remoteData.updateTime > localData.updateTime -> {
+                            libLogDLazy(cachedTag) { "    决策: 服务端较新 → 下载" }
+                            val processed = handleRemoteDataForDownload(remoteData, failureMessages)
+                            processed?.let { updatedLocalData.add(it) }
+                            stats.downloaded++
+                        }
+
+                        localData.updateTime > remoteData.updateTime -> {
+                            libLogDLazy(cachedTag) { "    决策: 本地较新 → 上传" }
+                            val processed = handleLocalDataForUpload(localData, failureMessages)
+                            processed?.let {
+                                updatedRemoteData.add(it)
+                                if (it != localData) {
+                                    updatedLocalData.add(it)
+                                    markFileForDeletion(it, localData)
+                                }
+                            }
+                            stats.uploaded++
+                        }
+
+                        else -> {
+                            libLogDLazy(cachedTag) { "    决策: 时间相同 → 跳过" }
+                            stats.skipped++
+                        }
+                    }
+                }
+            }
+
+            SyncOption.SYNC_OFF -> { /* 不处理 */ }
+        }
+    }
+
+    /**
+     * 执行批量更新操作
+     */
+    private suspend fun performBatchUpdates(
+        updatedRemoteData: List<T>,
+        updatedLocalData: List<T>,
+        failureMessages: MutableList<String>,
+        filesToDeleteAfterSuccess: Map<Long, String>
+    ) {
+        libLogI("💾 步骤: 批量数据更新")
+
+        // 上传到服务器
+        if (updatedRemoteData.isNotEmpty()) {
+            libLogI("  ☁️ 正在上传 ${updatedRemoteData.size} 个项目到服务器...")
+            val uploadStartTime = System.currentTimeMillis()
+            val remotePutResult = repository.remoteBatchUpsert(updatedRemoteData)
+            val uploadDuration = System.currentTimeMillis() - uploadStartTime
+
+            if (remotePutResult.isError()) {
+                libLogE("  ❌ 批量上传失败: ${remotePutResult.message}")
+                failureMessages.add("批量上传失败: ${remotePutResult.message}")
+            } else {
+                libLogI("  ✅ 批量上传成功，数量: ${updatedRemoteData.size}，耗时: ${uploadDuration}ms")
+
+                // 清理本地文件
+                if (syncConfig.isDeleteLocalFile && filesToDeleteAfterSuccess.isNotEmpty()) {
+                    cleanupLocalFiles(updatedRemoteData, filesToDeleteAfterSuccess)
+                }
+            }
+        }
+
+        // 更新本地数据库
+        if (updatedLocalData.isNotEmpty()) {
+            libLogI("  🗄️ 正在更新本地数据库 ${updatedLocalData.size} 个项目...")
+            val localUpdateStartTime = System.currentTimeMillis()
+            repository.localBatchUpsert(updatedLocalData)
+            val localUpdateDuration = System.currentTimeMillis() - localUpdateStartTime
+            libLogI("  ✅ 本地更新成功，数量: ${updatedLocalData.size}，耗时: ${localUpdateDuration}ms")
+        }
+
+        libLogI("────────────────────────────────────────────────────────")
+    }
+
+    /**
+     * 清理已上传的本地文件
+     */
+    private fun cleanupLocalFiles(
+        updatedRemoteData: List<T>,
+        filesToDeleteAfterSuccess: Map<Long, String>
+    ) {
+        libLogI("  🗑️ 正在清理已上传的本地文件...")
+        var deletedCount = 0
+        var failedCount = 0
+
+        updatedRemoteData.forEach { updatedItem ->
+            filesToDeleteAfterSuccess[updatedItem.id]?.let { localPath ->
+                try {
+                    val fileToDelete = File(localPath)
+                    if (fileToDelete.exists()) {
+                        if (fileToDelete.delete()) {
+                            libLogD("    ✓ 已删除: $localPath")
+                            deletedCount++
+                        } else {
+                            libLogW("    ✗ 删除失败: $localPath")
+                            failedCount++
+                        }
+                    }
+                } catch (e: SecurityException) {
+                    libLogE("    💥 删除异常: $localPath - ${e.message}")
+                    failedCount++
+                }
+            }
+        }
+        libLogI("    文件清理完成: 成功 $deletedCount, 失败 $failedCount")
+    }
+
+    /**
+     * 完成同步结果统计和日志
+     */
+    private fun finalizeSyncResult(
+        startTime: Long,
+        stats: SyncStats,
+        failureMessages: List<String>
+    ): Result {
+        val endTime = System.currentTimeMillis()
+        val duration = endTime - startTime
+
+        if (duration > TIMEOUT_THRESHOLD_MS) {
+            libLogW("⏱️ 警告: 任务耗时超过5分钟! 实际: ${duration}ms")
+        }
+
+        libLogI("════════════════════════════════════════════════════════")
+        libLogI("📊 同步任务完成: $workChineseName")
+        libLogI("  下载: ${stats.downloaded} 项")
+        libLogI("  上传: ${stats.uploaded} 项")
+        libLogI("  跳过: ${stats.skipped} 项")
+        libLogI("  总耗时: ${duration}ms")
+        libLogI("════════════════════════════════════════════════════════")
+
+        return if (failureMessages.isEmpty()) {
+            libLogI("✅ 任务状态: 成功")
+            Result.success(createSuccessData("${syncOptionName}增量更新成功，耗时${duration}ms"))
+        } else {
+            libLogE("❌ 任务状态: 部分失败，错误: ${failureMessages.size} 个")
+            Result.failure(createFailData(failureMessages.joinToString("\n")))
+        }
+    }
+
+    /**
+     * 处理同步异常
+     */
+    private fun handleSyncException(
+        e: Exception,
+        startTime: Long,
+        failureMessages: MutableList<String>
+    ): Result {
+        val duration = System.currentTimeMillis() - startTime
+        libLogE("════════════════════════════════════════════════════════")
+        libLogE("💥 同步任务发生未捕获异常: $workChineseName")
+        libLogE("异常类型: ${e.javaClass.simpleName}")
+        libLogE("异常信息: ${e.message}")
+        libLogE("任务耗时: ${duration}ms")
+        libLogE("堆栈信息:")
+        libLogE(e.stackTraceToString())
+        libLogE("════════════════════════════════════════════════════════")
+
+        failureMessages.add("发生意外错误: ${e.message}")
+        return Result.failure(createFailData(failureMessages.joinToString("\n")))
     }
 
     /**

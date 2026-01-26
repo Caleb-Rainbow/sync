@@ -10,13 +10,22 @@ import com.util.ktor.model.ResultModel
  **/
 interface SyncRepository<T : SyncableEntity> {
     // 远程获取上次同步时间之后更新过的ID列表
+    @Deprecated("将在后续移除")
     suspend fun remoteGetAfterUpdateTime(lastSyncTime: String): ResultModel<List<Long>>
     // 本地获取上次同步时间之后更新过的ID列表
+    @Deprecated("将在后续移除")
     suspend fun localGetAfterUpdateTime(lastSyncTime: String): List<Long>
 
+    // 远程获取上次同步时间之后更新过的完整信息列表
+    suspend fun remoteGetAfterUpdateTimeBatch(lastSyncTime: String): ResultModel<List<T>>
+    // 本地获取上次同步时间之后更新过的完整信息列表
+    suspend fun localGetAfterUpdateTimeBatch(lastSyncTime: String): List<T>
+
     // 远程根据ID获取单个实体
+    @Deprecated("将在后续移除")
     suspend fun remoteGetById(id: Long): ResultModel<T>
     // 本地根据ID获取单个实体
+    @Deprecated("将在后续移除")
     suspend fun localGetById(id: Long): T?
 
     // 远程批量更新或插入

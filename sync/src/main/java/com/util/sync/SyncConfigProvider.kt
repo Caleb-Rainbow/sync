@@ -16,6 +16,11 @@ interface SyncConfigProvider {
     var heartbeatPeriod: Int
     var deviceNumber: String
     var batchSize: Int
+    /**
+     * 当前同步模式，批量还是根据id单查
+     * 0-id单查  1-批量
+     * */
+    var syncMode:Int
 
     /**
      * 保存最近一次同步成功的时间戳。
