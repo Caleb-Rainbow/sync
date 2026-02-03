@@ -176,6 +176,16 @@ class SyncWorkManager(val context: Context) {
 - `syncOptionInt`: 同步选项整数值
 - `syncConfig`: 同步配置
 
+**内部统计数据类 SyncStats**：
+```kotlin
+data class SyncStats(
+    var downloaded: Int = 0,   // 下载的项目数量
+    var uploaded: Int = 0,     // 上传的项目数量
+    var skipped: Int = 0,      // 跳过的项目数量
+    var failedFetch: Int = 0   // 获取失败的项目数量
+)
+```
+
 **支持的同步模式**：
 - **ID 单查模式** (syncMode = 0)：先获取 ID 列表，再逐个获取详情
 - **批量模式** (syncMode = 1)：直接批量获取完整数据，性能更优
@@ -441,7 +451,7 @@ val description = syncOption.description // "设备单向上传"
 
 ```kotlin
 dependencies {
-    implementation("com.github.Caleb-Rainbow:sync:1.0.7")
+    implementation("com.github.Caleb-Rainbow:sync:2026.02.03.01")
 }
 ```
 
@@ -879,7 +889,7 @@ fun logOperation(tag: String, type: String, result: String, params: Map<String, 
 
 #### 扩展函数
 
-库提供了便捷的扩展函数，使用时无需手动传递 tag：
+库提供了便捷的扩展函数，使用时无需手动传递 tag（TAG 自动从类名获取）：
 
 ```kotlin
 // 基础日志
@@ -892,9 +902,25 @@ libLogE("错误信息", exception)
 libLogOpStart("数据同步", params = mapOf("id" to 123))
 libLogOpSuccess("数据同步", params = mapOf("count" to 10))
 libLogOpFail("数据同步", error = "网络错误")
+```
 
-// 惰性日志（避免不必要的字符串拼接）
-libLogDLazy(tag) { "耗时: ${calculateExpensiveValue()}ms" }
+**扩展属性**：
+```kotlin
+// 获取当前类的 TAG（已缓存，避免反射开销）
+val tag = this.libLogTag
+```
+
+**惰性日志扩展**（用于高频调用场景，避免不必要的字符串拼接开销）：
+```kotlin
+// 需要预先缓存 TAG 以提高性能
+private val cachedTag = this.libLogTag
+
+// 使用惰性日志，只有当日志会被输出时才执行 lambda
+libLogDLazy(cachedTag) { "耗时: ${calculateExpensiveValue()}ms" }
+libLogILazy(cachedTag) { "处理数据: ${expensiveOperation()}" }
+libLogWLazy(cachedTag) { "警告: ${buildWarningMessage()}" }
+libLogELazy(cachedTag) { "错误: ${buildErrorMessage()}" }
+libLogVLazy(cachedTag) { "详细: ${buildVerboseMessage()}" }
 ```
 
 ---
@@ -1477,14 +1503,15 @@ override var batchSize: Int = 100 // 设置合适的批量大小
 
 ## 版本信息
 
-### 当前版本：1.0.7
+### 当前版本：2026.02.03.01
 
 ### 版本历史
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
-| 1.0.7 | 2025-01-21 | 初始版本发布 |
+| 2026.02.03.01 | 2026-02-03 | 新增 SyncStats 统计数据类；优化日志性能（TAG 缓存、惰性求值）；改进异常处理和日志输出 |
 | 1.0.8 | 2025-01-26 | 重构日志系统，采用依赖注入方式；新增批量同步模式；优化同步性能 |
+| 1.0.7 | 2025-01-21 | 初始版本发布 |
 
 ### 依赖版本
 
@@ -1587,4 +1614,4 @@ override var batchSize: Int = 100 // 设置合适的批量大小
 
 ---
 
-**最后更新时间：2025-01-26**
+**最后更新时间：2026-02-03**
