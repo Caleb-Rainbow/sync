@@ -156,7 +156,7 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
             return@withContext if (syncMode == 1) {
                 executeBatchMode(startTime, sessionId, lastSyncTime, syncOption)
             } else {
-                executeIdQueryMode(startTime, sessionId, lastSyncTime, syncOption)
+                executeIdQueryMode(startTime, lastSyncTime, syncOption)
             }
         }
     }
@@ -168,7 +168,6 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
     @Suppress("DEPRECATION")
     private suspend fun executeIdQueryMode(
         startTime: Long,
-        sessionId: String,
         lastSyncTime: String,
         syncOption: SyncOption
     ): Result = withContext(Dispatchers.IO) {
@@ -415,7 +414,7 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
 
         when (syncOption) {
             SyncOption.DEVICE_UPLOAD -> localData?.let {
-                libLogDLazy(cachedTag) { "  📤 [ID: $itemId] 模式: 仅上传" }
+                //libLogDLazy(cachedTag) { "  📤 [ID: $itemId] 模式: 仅上传" }
                 val processed = handleLocalDataForUpload(it, failureMessages)
                 processed?.let { element ->
                     updatedRemoteData.add(element)
@@ -428,7 +427,7 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
             }
 
             SyncOption.SERVER_DOWNLOAD -> remoteData?.let {
-                libLogDLazy(cachedTag) { "  📥 [ID: $itemId] 模式: 仅下载" }
+                //libLogDLazy(cachedTag) { "  📥 [ID: $itemId] 模式: 仅下载" }
                 val processed = handleRemoteDataForDownload(it, failureMessages)
                 processed?.let { element ->
                     updatedLocalData.add(element)
@@ -438,7 +437,7 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
 
             SyncOption.TWO_WAY_SYNC -> when {
                 remoteData == null && localData != null -> {
-                    libLogDLazy(cachedTag) { "  📤 [ID: $itemId] 双向同步: 服务端无此数据，执行上传" }
+                    //libLogDLazy(cachedTag) { "  📤 [ID: $itemId] 双向同步: 服务端无此数据，执行上传" }
                     val processed = handleLocalDataForUpload(localData, failureMessages)
                     processed?.let {
                         updatedRemoteData.add(it)
@@ -451,7 +450,7 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                 }
 
                 remoteData != null && localData == null -> {
-                    libLogDLazy(cachedTag) { "  📥 [ID: $itemId] 双向同步: 本地无此数据，执行下载" }
+                    //libLogDLazy(cachedTag) { "  📥 [ID: $itemId] 双向同步: 本地无此数据，执行下载" }
                     val processed = handleRemoteDataForDownload(remoteData, failureMessages)
                     processed?.let {
                         updatedLocalData.add(it)
@@ -460,17 +459,17 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                 }
 
                 remoteData != null && localData != null -> {
-                    libLogDLazy(cachedTag) { "  🔀 [ID: $itemId] 双向同步: 冲突解决" }
+                    //libLogDLazy(cachedTag) { "  🔀 [ID: $itemId] 双向同步: 冲突解决" }
                     when {
                         remoteData.updateTime > localData.updateTime -> {
-                            libLogDLazy(cachedTag) { "    决策: 服务端较新 → 下载" }
+                            //libLogDLazy(cachedTag) { "    决策: 服务端较新 → 下载" }
                             val processed = handleRemoteDataForDownload(remoteData, failureMessages)
                             processed?.let { updatedLocalData.add(it) }
                             stats.downloaded++
                         }
 
                         localData.updateTime > remoteData.updateTime -> {
-                            libLogDLazy(cachedTag) { "    决策: 本地较新 → 上传" }
+                            //libLogDLazy(cachedTag) { "    决策: 本地较新 → 上传" }
                             val processed = handleLocalDataForUpload(localData, failureMessages)
                             processed?.let {
                                 updatedRemoteData.add(it)
@@ -483,7 +482,7 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                         }
 
                         else -> {
-                            libLogDLazy(cachedTag) { "    决策: 时间相同 → 跳过" }
+                            //libLogDLazy(cachedTag) { "    决策: 时间相同 → 跳过" }
                             stats.skipped++
                         }
                     }
