@@ -24,8 +24,8 @@ extensions.configure<LibraryExtension>("android") {
         }
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
     sourceSets["main"].java.directories.add("src/main/java")
     publishing {
@@ -43,7 +43,7 @@ publishing {
         create<MavenPublication>("release") {
             groupId = "com.github.Caleb-Rainbow"
             artifactId = "sync"
-            version = "2026.02.03.01"
+            version = "2026.03.14.01"
 
             afterEvaluate {
                 from(components["release"])
@@ -53,6 +53,7 @@ publishing {
 }
 
 dependencies {
+    //implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar", "*.aar"))))
     //雪花id生成
     api(libs.idgenerator)
     //work
