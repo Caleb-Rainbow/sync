@@ -422,8 +422,8 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                         updatedLocalData.add(element)
                         markFileForDeletion(element, it)
                     }
+                    stats.uploaded++
                 }
-                stats.uploaded++
             }
 
             SyncOption.SERVER_DOWNLOAD -> remoteData?.let {
@@ -431,8 +431,8 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                 val processed = handleRemoteDataForDownload(it, failureMessages)
                 processed?.let { element ->
                     updatedLocalData.add(element)
+                    stats.downloaded++
                 }
-                stats.downloaded++
             }
 
             SyncOption.TWO_WAY_SYNC -> when {
@@ -445,8 +445,8 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                             updatedLocalData.add(it)
                             markFileForDeletion(it, localData)
                         }
+                        stats.uploaded++
                     }
-                    stats.uploaded++
                 }
 
                 remoteData != null && localData == null -> {
@@ -454,8 +454,8 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                     val processed = handleRemoteDataForDownload(remoteData, failureMessages)
                     processed?.let {
                         updatedLocalData.add(it)
+                        stats.downloaded++
                     }
-                    stats.downloaded++
                 }
 
                 remoteData != null && localData != null -> {
@@ -464,8 +464,10 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                         remoteData.updateTime > localData.updateTime -> {
                             //libLogDLazy(cachedTag) { "    决策: 服务端较新 → 下载" }
                             val processed = handleRemoteDataForDownload(remoteData, failureMessages)
-                            processed?.let { updatedLocalData.add(it) }
-                            stats.downloaded++
+                            processed?.let {
+                                updatedLocalData.add(it)
+                                stats.downloaded++
+                            }
                         }
 
                         localData.updateTime > remoteData.updateTime -> {
@@ -477,8 +479,8 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                                     updatedLocalData.add(it)
                                     markFileForDeletion(it, localData)
                                 }
+                                stats.uploaded++
                             }
-                            stats.uploaded++
                         }
 
                         else -> {
