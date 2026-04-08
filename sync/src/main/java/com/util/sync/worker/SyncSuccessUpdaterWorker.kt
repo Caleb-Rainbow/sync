@@ -3,14 +3,13 @@ package com.util.sync.worker
 import android.content.Context
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import com.util.sync.KEY_SYNC_START_TIME
 import com.util.sync.SyncConfigProvider
 import com.util.sync.log.libLogD
 import com.util.sync.log.libLogE
 import com.util.sync.log.libLogI
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 
 /**
@@ -26,11 +25,16 @@ class SyncSuccessUpdaterWorker(
     private val configProvider: SyncConfigProvider
 ) : CoroutineWorker(context, params) {
 
-    private val dateFormat by lazy {
-        SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
+    private val logDateFormatter by lazy {
+        java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
     }
 
-    private fun formatTimestamp(timeMs: Long): String = dateFormat.format(Date(timeMs))
+    private val utcZone = java.time.ZoneOffset.UTC
+
+    private fun formatTimestamp(timeMs: Long): String =
+        java.time.Instant.ofEpochMilli(timeMs)
+            .atZone(utcZone)
+            .format(logDateFormatter)
 
     override suspend fun doWork() = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
@@ -43,7 +47,7 @@ class SyncSuccessUpdaterWorker(
         libLogI("════════════════════════════════════════")
 
         // 从输入数据中获取本次同步开始的时间戳
-        val syncStartTime = inputData.getString("KEY_SYNC_START_TIME")
+        val syncStartTime = inputData.getString(KEY_SYNC_START_TIME)
 
         libLogD("  输入参数 KEY_SYNC_START_TIME: $syncStartTime")
 

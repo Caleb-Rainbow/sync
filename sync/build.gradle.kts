@@ -1,4 +1,5 @@
 import com.android.build.api.dsl.LibraryExtension
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     id("maven-publish")
@@ -37,7 +38,11 @@ extensions.configure<LibraryExtension>("android") {
         buildConfig = true
     }
 }
-
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_21)
+    }
+}
 publishing {
     publications {
         create<MavenPublication>("release") {

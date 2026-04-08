@@ -13,8 +13,6 @@ import com.util.sync.log.libLogI
 import com.util.sync.log.libLogW
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 
 /**
@@ -35,11 +33,16 @@ class HeartWork(
         private const val TIMEOUT_THRESHOLD_MS = 5 * 60 * 1000L // 5分钟超时阈值
     }
     
-    private val dateFormat by lazy {
-        SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
+    private val logDateFormatter by lazy {
+        java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
     }
-    
-    private fun formatTimestamp(timeMs: Long): String = dateFormat.format(Date(timeMs))
+
+    private val utcZone = java.time.ZoneOffset.UTC
+
+    private fun formatTimestamp(timeMs: Long): String =
+        java.time.Instant.ofEpochMilli(timeMs)
+            .atZone(utcZone)
+            .format(logDateFormatter)
     
     override suspend fun doWork() = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()

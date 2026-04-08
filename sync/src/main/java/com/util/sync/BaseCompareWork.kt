@@ -12,12 +12,13 @@ import com.util.sync.log.libLogI
 import com.util.sync.log.libLogTag
 import com.util.sync.log.libLogW
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 
 /**
@@ -32,15 +33,24 @@ const val KEY_SYNC_START_TIME = "KEY_SYNC_START_TIME"
 const val KEY_SYNC_SESSION_ID = "KEY_SYNC_SESSION_ID"
 
 /**
- * 同步统计数据类
- * 使用可变属性替代 Map，避免频繁的 getOrDefault 开销
+ * 同步统计数据类（可变计数器）
+ * 用于在同步过程中统计各项操作的计数。
+ * 虽然使用 var 字段，但仅在单一线程的顺序处理流程中使用，不涉及并发修改。
  */
-data class SyncStats(
-    var downloaded: Int = 0,
-    var uploaded: Int = 0,
-    var skipped: Int = 0,
-    var failedFetch: Int = 0
-)
+class SyncStats {
+    var downloaded: Int = 0; private set
+    var uploaded: Int = 0; private set
+    var skipped: Int = 0; private set
+    var failedFetch: Int = 0; private set
+
+    fun recordDownload() { downloaded++ }
+    fun recordUpload() { uploaded++ }
+    fun recordSkip() { skipped++ }
+    fun recordFailedFetch() { failedFetch++ }
+
+    override fun toString(): String =
+        "SyncStats(downloaded=$downloaded, uploaded=$uploaded, skipped=$skipped, failedFetch=$failedFetch)"
+}
 
 abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
     context: Context,
@@ -49,6 +59,17 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
 
     companion object {
         private const val TIMEOUT_THRESHOLD_MS = 5 * 60 * 1000L // 5分钟超时阈值
+        private const val TIME_SKEW_THRESHOLD_MS = 3000L // 3秒时钟偏差容忍阈值
+        private const val MAX_ID_QUERY_CONCURRENCY = 8 // ID 单查模式最大并发请求数
+
+        /** UTC 标准格式，带毫秒和时区偏移量 */
+        private val UTC_FORMATTER by lazy {
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
+        }
+        private val UTC_FALLBACK_FORMATTER by lazy {
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+        }
+        private val UTC_ZONE = java.time.ZoneOffset.UTC
     }
 
     // --- 由子类提供的抽象属性 ---
@@ -59,14 +80,57 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
     abstract val syncOptionInt: Int
     abstract val syncConfig: SyncConfigProvider
 
-    private val dateFormat by lazy {
-        SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
-    }
-
     // 缓存 TAG，避免每次日志调用时通过反射获取类名
     private val cachedTag: String by lazy { this.libLogTag }
 
-    private fun formatTimestamp(timeMs: Long): String = dateFormat.format(Date(timeMs))
+    /**
+     * 将 epoch 毫秒格式化为 UTC 时间字符串（带毫秒），用于日志输出。
+     * 使用 UTC 避免设备时区变更导致的时间错乱。
+     */
+    private fun formatTimestamp(timeMs: Long): String =
+        java.time.Instant.ofEpochMilli(timeMs)
+            .atZone(UTC_ZONE)
+            .format(UTC_FORMATTER)
+
+    /**
+     * 将 updateTime 字符串解析为 epoch 毫秒数，用于可靠的数值比较。
+     * 兼容两种格式：带毫秒("yyyy-MM-dd HH:mm:ss.SSS")和不带毫秒("yyyy-MM-dd HH:mm:ss")。
+     * 优先按 UTC 解析；若失败，回退到系统时区（兼容旧数据）。
+     * 解析失败返回 null，调用方需处理解析失败的情况。
+     */
+    private fun parseUpdateTime(time: String): Long? {
+        return try {
+            // 优先按 UTC 解析
+            java.time.LocalDateTime.parse(time, UTC_FORMATTER)
+                .toInstant(UTC_ZONE)
+                .toEpochMilli()
+        } catch (_: Exception) {
+            try {
+                // 回退到不带毫秒的 UTC 格式
+                java.time.LocalDateTime.parse(time, UTC_FALLBACK_FORMATTER)
+                    .toInstant(UTC_ZONE)
+                    .toEpochMilli()
+            } catch (_: Exception) {
+                try {
+                    // 最后回退：按系统时区解析（兼容旧版本生成的数据）
+                    java.time.LocalDateTime.parse(time, UTC_FORMATTER)
+                        .atZone(java.time.ZoneId.systemDefault())
+                        .toInstant()
+                        .toEpochMilli()
+                } catch (_: Exception) {
+                    try {
+                        java.time.LocalDateTime.parse(time, UTC_FALLBACK_FORMATTER)
+                            .atZone(java.time.ZoneId.systemDefault())
+                            .toInstant()
+                            .toEpochMilli()
+                    } catch (e: Exception) {
+                        libLogE("updateTime 解析失败: $time, ${e.message}")
+                        null
+                    }
+                }
+            }
+        }
+    }
 
     // --- 用于特殊处理的钩子方法，子类可以重写 ---
 
@@ -191,7 +255,7 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
 
                 if (remoteIdsResult.isError()) {
                     libLogE("  ❌ 获取服务端 ID 列表失败: ${remoteIdsResult.message}")
-                    failureMessages.add("获取服务端 ID列表失败: ${remoteIdsResult.message}")
+                    return@withContext Result.failure(createFailData("获取服务端 ID列表失败: ${remoteIdsResult.message}"))
                 } else {
                     remoteIds = remoteIdsResult.data ?: emptyList()
                     libLogI("  ✅ 服务端: ${remoteIds.size} 个，耗时: ${fetchDuration}ms")
@@ -221,27 +285,33 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
             val batchSize = syncConfig.batchSize
             val fetchDetailStartTime = System.currentTimeMillis()
 
+            // 使用 Semaphore 限制并发数，避免大量并发网络请求
+            val maxConcurrency = minOf(batchSize.coerceAtLeast(1), MAX_ID_QUERY_CONCURRENCY)
+            val semaphore = Semaphore(maxConcurrency)
+            libLogD("  并发控制: 最大并发数 $maxConcurrency")
+
             val allFetchedData = allIds.chunked(batchSize).flatMapIndexed { batchIndex, batchIds ->
                 batchIds.map { itemId ->
                     async {
-                        try {
-                            val remoteDataResult = if (syncOption == SyncOption.SERVER_DOWNLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
-                                repository.remoteGetById(itemId)
-                            } else null
+                        semaphore.withPermit {
+                            try {
+                                val remoteDataResult = if (syncOption == SyncOption.SERVER_DOWNLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
+                                    repository.remoteGetById(itemId)
+                                } else null
 
-                            if (remoteDataResult?.isError() == true) {
-                                failureMessages.add("获取远程数据失败 (ID: $itemId): ${remoteDataResult.message}")
-                                return@async FetchedData(id = itemId, local = null, remote = null, error = remoteDataResult.message)
+                                if (remoteDataResult?.isError() == true) {
+                                    // 不在 async 中直接操作 failureMessages，通过 error 字段传递
+                                    return@withPermit FetchedData(id = itemId, local = null, remote = null, error = "获取远程数据失败 (ID: $itemId): ${remoteDataResult.message}")
+                                }
+
+                                val localData = if (syncOption == SyncOption.DEVICE_UPLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
+                                    repository.localGetById(itemId)
+                                } else null
+
+                                FetchedData(id = itemId, local = localData, remote = remoteDataResult?.data)
+                            } catch (e: Exception) {
+                                FetchedData(id = itemId, local = null, remote = null, error = "获取数据异常 (ID: $itemId): ${e.message}")
                             }
-
-                            val localData = if (syncOption == SyncOption.DEVICE_UPLOAD || syncOption == SyncOption.TWO_WAY_SYNC) {
-                                repository.localGetById(itemId)
-                            } else null
-
-                            FetchedData(id = itemId, local = localData, remote = remoteDataResult?.data)
-                        } catch (e: Exception) {
-                            failureMessages.add("获取数据异常 (ID: $itemId): ${e.message}")
-                            FetchedData(id = itemId, local = null, remote = null, error = e.message)
                         }
                     }
                 }.awaitAll()
@@ -250,26 +320,31 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
             libLogI("  ✅ 数据获取完成，耗时: ${System.currentTimeMillis() - fetchDetailStartTime}ms")
 
             libLogI("⚙️ 步骤 3: 数据比对与处理")
-            val updatedLocalData = mutableListOf<T>()
+            val updatedLocalDataFromRemote = mutableListOf<T>()
+            val updatedLocalDataFromUpload = mutableListOf<T>()
             val updatedRemoteData = mutableListOf<T>()
 
             for (fetched in allFetchedData) {
                 if (fetched.error != null) {
-                    stats.failedFetch++
+                    // 顺序收集错误消息，避免并发修改
+                    failureMessages.add(fetched.error)
+                    stats.recordFailedFetch()
                     continue
                 }
                 processDataComparison(
                     fetched.local, fetched.remote, fetched.id, syncOption,
-                    failureMessages, stats, updatedLocalData, updatedRemoteData,
-                    filesToDeleteAfterSuccess
+                    failureMessages, stats, updatedLocalDataFromRemote, updatedLocalDataFromUpload,
+                    updatedRemoteData, filesToDeleteAfterSuccess
                 )
             }
 
-            libLogI("  ✅ 待上传: ${updatedRemoteData.size} 项，待更新本地: ${updatedLocalData.size} 项")
+            libLogI("  ✅ 待上传: ${updatedRemoteData.size} 项，待更新本地(远程): ${updatedLocalDataFromRemote.size} 项，待更新本地(上传): ${updatedLocalDataFromUpload.size} 项")
 
-            performBatchUpdates(updatedRemoteData, updatedLocalData, failureMessages, filesToDeleteAfterSuccess)
-            
+            performBatchUpdates(updatedRemoteData, updatedLocalDataFromRemote, updatedLocalDataFromUpload, failureMessages, filesToDeleteAfterSuccess)
+
             finalizeSyncResult(startTime, stats, failureMessages)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             handleSyncException(e, startTime, failureMessages)
         }
@@ -308,13 +383,12 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
 
                 if (remoteResult.isError()) {
                     libLogE("  ❌ 批量获取服务端数据失败: ${remoteResult.message}")
-                    failureMessages.add("批量获取服务端数据失败: ${remoteResult.message}")
-                } else {
-                    remoteDataList = remoteResult.data ?: emptyList()
-                    libLogI("  ✅ 服务端数据获取成功")
-                    libLogI("    数量: ${remoteDataList.size} 个")
-                    libLogI("    请求耗时: ${fetchDuration}ms")
+                    return@withContext Result.failure(createFailData("批量获取服务端数据失败: ${remoteResult.message}"))
                 }
+                remoteDataList = remoteResult.data ?: emptyList()
+                libLogI("  ✅ 服务端数据获取成功")
+                libLogI("    数量: ${remoteDataList.size} 个")
+                libLogI("    请求耗时: ${fetchDuration}ms")
             }
 
             // 获取本地更新数据
@@ -358,7 +432,11 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
             libLogI("⚙️ 步骤 2: 内存中数据比对")
             val compareStartTime = System.currentTimeMillis()
 
-            val updatedLocalData = mutableListOf<T>()
+            // 区分两个本地更新来源：
+            // - fromRemote: 来自服务端数据，始终写入本地
+            // - fromUpload: 上传处理后需更新本地，仅在远程上传成功时写入
+            val updatedLocalDataFromRemote = mutableListOf<T>()
+            val updatedLocalDataFromUpload = mutableListOf<T>()
             val updatedRemoteData = mutableListOf<T>()
 
             for (itemId in allIds) {
@@ -367,23 +445,26 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
 
                 processDataComparison(
                     localData, remoteData, itemId, syncOption,
-                    failureMessages, stats, updatedLocalData, updatedRemoteData,
-                    filesToDeleteAfterSuccess
+                    failureMessages, stats, updatedLocalDataFromRemote, updatedLocalDataFromUpload,
+                    updatedRemoteData, filesToDeleteAfterSuccess
                 )
             }
 
             val compareDuration = System.currentTimeMillis() - compareStartTime
             libLogI("  ✅ 数据比对完成，耗时: ${compareDuration}ms")
             libLogI("  待上传: ${updatedRemoteData.size} 项")
-            libLogI("  待更新本地: ${updatedLocalData.size} 项")
+            libLogI("  待更新本地(来自服务端): ${updatedLocalDataFromRemote.size} 项")
+            libLogI("  待更新本地(来自上传): ${updatedLocalDataFromUpload.size} 项")
             libLogI("────────────────────────────────────────────────────────")
 
             // ═══════════════════════════════════════════════════════════
             // 步骤 3: 批量更新
             // ═══════════════════════════════════════════════════════════
-            performBatchUpdates(updatedRemoteData, updatedLocalData, failureMessages, filesToDeleteAfterSuccess)
+            performBatchUpdates(updatedRemoteData, updatedLocalDataFromRemote, updatedLocalDataFromUpload, failureMessages, filesToDeleteAfterSuccess)
 
             finalizeSyncResult(startTime, stats, failureMessages)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             handleSyncException(e, startTime, failureMessages)
         }
@@ -391,6 +472,10 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
 
     /**
      * 通用的数据比对处理逻辑
+     *
+     * updatedLocalDataFromRemote: 来自服务端、需要写入本地的数据（无论远程上传是否成功都应写入）
+     * updatedLocalDataFromUpload: 来自本地上传处理、需要同步更新本地的数据（仅在远程上传成功时才写入）
+     * updatedRemoteData: 需要上传到服务器的数据
      */
     private suspend fun processDataComparison(
         localData: T?,
@@ -399,7 +484,8 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
         syncOption: SyncOption,
         failureMessages: MutableList<String>,
         stats: SyncStats,
-        updatedLocalData: MutableList<T>,
+        updatedLocalDataFromRemote: MutableList<T>,
+        updatedLocalDataFromUpload: MutableList<T>,
         updatedRemoteData: MutableList<T>,
         filesToDeleteAfterSuccess: MutableMap<Long, String>
     ) {
@@ -414,78 +500,78 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
 
         when (syncOption) {
             SyncOption.DEVICE_UPLOAD -> localData?.let {
-                //libLogDLazy(cachedTag) { "  📤 [ID: $itemId] 模式: 仅上传" }
                 val processed = handleLocalDataForUpload(it, failureMessages)
                 processed?.let { element ->
                     updatedRemoteData.add(element)
                     if (element != it) {
-                        updatedLocalData.add(element)
+                        updatedLocalDataFromUpload.add(element)
                         markFileForDeletion(element, it)
                     }
-                    stats.uploaded++
+                    stats.recordUpload()
                 }
             }
 
             SyncOption.SERVER_DOWNLOAD -> remoteData?.let {
-                //libLogDLazy(cachedTag) { "  📥 [ID: $itemId] 模式: 仅下载" }
                 val processed = handleRemoteDataForDownload(it, failureMessages)
                 processed?.let { element ->
-                    updatedLocalData.add(element)
-                    stats.downloaded++
+                    updatedLocalDataFromRemote.add(element)
+                    stats.recordDownload()
                 }
             }
 
             SyncOption.TWO_WAY_SYNC -> when {
                 remoteData == null && localData != null -> {
-                    //libLogDLazy(cachedTag) { "  📤 [ID: $itemId] 双向同步: 服务端无此数据，执行上传" }
                     val processed = handleLocalDataForUpload(localData, failureMessages)
                     processed?.let {
                         updatedRemoteData.add(it)
                         if (it != localData) {
-                            updatedLocalData.add(it)
+                            updatedLocalDataFromUpload.add(it)
                             markFileForDeletion(it, localData)
                         }
-                        stats.uploaded++
+                        stats.recordUpload()
                     }
                 }
 
                 remoteData != null && localData == null -> {
-                    //libLogDLazy(cachedTag) { "  📥 [ID: $itemId] 双向同步: 本地无此数据，执行下载" }
                     val processed = handleRemoteDataForDownload(remoteData, failureMessages)
                     processed?.let {
-                        updatedLocalData.add(it)
-                        stats.downloaded++
+                        updatedLocalDataFromRemote.add(it)
+                        stats.recordDownload()
                     }
                 }
 
                 remoteData != null && localData != null -> {
-                    //libLogDLazy(cachedTag) { "  🔀 [ID: $itemId] 双向同步: 冲突解决" }
-                    when {
-                        remoteData.updateTime > localData.updateTime -> {
-                            //libLogDLazy(cachedTag) { "    决策: 服务端较新 → 下载" }
-                            val processed = handleRemoteDataForDownload(remoteData, failureMessages)
-                            processed?.let {
-                                updatedLocalData.add(it)
-                                stats.downloaded++
+                    val remoteTime = parseUpdateTime(remoteData.updateTime)
+                    val localTime = parseUpdateTime(localData.updateTime)
+                    if (remoteTime == null || localTime == null) {
+                        failureMessages.add("ID: $itemId updateTime 解析失败, remote=${remoteData.updateTime}, local=${localData.updateTime}")
+                        stats.recordFailedFetch()
+                    } else {
+                        val diff = kotlin.math.abs(remoteTime - localTime)
+                        when {
+                            // 时间差在容忍阈值内，视为同时更新，跳过
+                            diff <= TIME_SKEW_THRESHOLD_MS -> {
+                                stats.recordSkip()
                             }
-                        }
-
-                        localData.updateTime > remoteData.updateTime -> {
-                            //libLogDLazy(cachedTag) { "    决策: 本地较新 → 上传" }
-                            val processed = handleLocalDataForUpload(localData, failureMessages)
-                            processed?.let {
-                                updatedRemoteData.add(it)
-                                if (it != localData) {
-                                    updatedLocalData.add(it)
-                                    markFileForDeletion(it, localData)
+                            remoteTime > localTime -> {
+                                val processed = handleRemoteDataForDownload(remoteData, failureMessages)
+                                processed?.let {
+                                    updatedLocalDataFromRemote.add(it)
+                                    stats.recordDownload()
                                 }
-                                stats.uploaded++
                             }
-                        }
 
-                        else -> {
-                            //libLogDLazy(cachedTag) { "    决策: 时间相同 → 跳过" }
-                            stats.skipped++
+                            localTime > remoteTime -> {
+                                val processed = handleLocalDataForUpload(localData, failureMessages)
+                                processed?.let {
+                                    updatedRemoteData.add(it)
+                                    if (it != localData) {
+                                        updatedLocalDataFromUpload.add(it)
+                                        markFileForDeletion(it, localData)
+                                    }
+                                    stats.recordUpload()
+                                }
+                            }
                         }
                     }
                 }
@@ -497,16 +583,24 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
 
     /**
      * 执行批量更新操作
+     *
+     * @param updatedRemoteData 需要上传到服务器的数据
+     * @param updatedLocalDataFromRemote 来自服务端、需要写入本地的数据（始终写入）
+     * @param updatedLocalDataFromUpload 上传处理后需更新本地的数据（仅远程上传成功时才写入，保证一致性）
+     * @param failureMessages 失败消息列表
+     * @param filesToDeleteAfterSuccess 待删除的本地文件映射
      */
     private suspend fun performBatchUpdates(
         updatedRemoteData: List<T>,
-        updatedLocalData: List<T>,
+        updatedLocalDataFromRemote: List<T>,
+        updatedLocalDataFromUpload: List<T>,
         failureMessages: MutableList<String>,
         filesToDeleteAfterSuccess: Map<Long, String>
     ) {
         libLogI("💾 步骤: 批量数据更新")
 
         // 上传到服务器
+        var remoteUploadSucceeded = false
         if (updatedRemoteData.isNotEmpty()) {
             libLogI("  ☁️ 正在上传 ${updatedRemoteData.size} 个项目到服务器...")
             val uploadStartTime = System.currentTimeMillis()
@@ -517,22 +611,60 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                 libLogE("  ❌ 批量上传失败: ${remotePutResult.message}")
                 failureMessages.add("批量上传失败: ${remotePutResult.message}")
             } else {
+                remoteUploadSucceeded = true
                 libLogI("  ✅ 批量上传成功，数量: ${updatedRemoteData.size}，耗时: ${uploadDuration}ms")
+            }
+        } else {
+            // 没有需要上传的数据，视为成功
+            remoteUploadSucceeded = true
+        }
 
-                // 清理本地文件
-                if (syncConfig.isDeleteLocalFile && filesToDeleteAfterSuccess.isNotEmpty()) {
-                    cleanupLocalFiles(updatedRemoteData, filesToDeleteAfterSuccess)
-                }
+        // 步骤 1: 始终写入来自服务端的数据到本地
+        var localRemoteUpdateSucceeded = true
+        if (updatedLocalDataFromRemote.isNotEmpty()) {
+            libLogI("  🗄️ 正在写入服务端数据到本地 ${updatedLocalDataFromRemote.size} 个项目...")
+            val localUpdateStartTime = System.currentTimeMillis()
+            try {
+                repository.localBatchUpsert(updatedLocalDataFromRemote)
+                val localUpdateDuration = System.currentTimeMillis() - localUpdateStartTime
+                libLogI("  ✅ 服务端数据写入本地成功，数量: ${updatedLocalDataFromRemote.size}，耗时: ${localUpdateDuration}ms")
+            } catch (e: Exception) {
+                localRemoteUpdateSucceeded = false
+                val localUpdateDuration = System.currentTimeMillis() - localUpdateStartTime
+                libLogE("  ❌ 服务端数据写入本地失败: ${e.message}，耗时: ${localUpdateDuration}ms")
+                failureMessages.add("本地数据库更新失败(服务端数据): ${e.message}")
             }
         }
 
-        // 更新本地数据库
-        if (updatedLocalData.isNotEmpty()) {
-            libLogI("  🗄️ 正在更新本地数据库 ${updatedLocalData.size} 个项目...")
-            val localUpdateStartTime = System.currentTimeMillis()
-            repository.localBatchUpsert(updatedLocalData)
-            val localUpdateDuration = System.currentTimeMillis() - localUpdateStartTime
-            libLogI("  ✅ 本地更新成功，数量: ${updatedLocalData.size}，耗时: ${localUpdateDuration}ms")
+        // 步骤 2: 仅在远程上传成功时，写入上传处理后的本地更新数据
+        var localUploadUpdateSucceeded = true
+        if (remoteUploadSucceeded && updatedLocalDataFromUpload.isNotEmpty()) {
+            libLogI("  🗄️ 正在同步本地上传状态 ${updatedLocalDataFromUpload.size} 个项目...")
+            val uploadUpdateStartTime = System.currentTimeMillis()
+            try {
+                repository.localBatchUpsert(updatedLocalDataFromUpload)
+                val uploadUpdateDuration = System.currentTimeMillis() - uploadUpdateStartTime
+                libLogI("  ✅ 本地上传状态更新成功，数量: ${updatedLocalDataFromUpload.size}，耗时: ${uploadUpdateDuration}ms")
+            } catch (e: Exception) {
+                localUploadUpdateSucceeded = false
+                libLogE("  ❌ 本地上传状态更新失败: ${e.message}")
+                failureMessages.add("本地数据库更新失败(上传状态): ${e.message}")
+            }
+        } else if (!remoteUploadSucceeded && updatedLocalDataFromUpload.isNotEmpty()) {
+            localUploadUpdateSucceeded = false
+            libLogW("  ⚠️ 远程上传失败，跳过 ${updatedLocalDataFromUpload.size} 个本地上传状态的更新，避免数据不一致")
+        }
+
+        // 清理本地文件（分阶段清理，避免部分失败导致文件泄漏）
+        if (syncConfig.isDeleteLocalFile && filesToDeleteAfterSuccess.isNotEmpty()) {
+            // 只有当远程上传成功 + 上传状态本地更新成功时，才清理对应的上传文件
+            val canCleanupUploadFiles = remoteUploadSucceeded && localUploadUpdateSucceeded
+            if (canCleanupUploadFiles) {
+                cleanupLocalFiles(updatedRemoteData, filesToDeleteAfterSuccess)
+            } else {
+                libLogW("  ⚠️ 跳过文件清理: 远程上传=${remoteUploadSucceeded}, 本地上传状态更新=${localUploadUpdateSucceeded}")
+                libLogW("  ⚠️ ${filesToDeleteAfterSuccess.size} 个本地文件暂不删除，将在下次成功同步后重试")
+            }
         }
 
         libLogI("────────────────────────────────────────────────────────")

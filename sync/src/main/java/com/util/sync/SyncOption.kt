@@ -1,7 +1,5 @@
 package com.util.sync
 
-import kotlin.collections.first
-
 /**
  * @description
  * @author 杨帅林
@@ -29,6 +27,6 @@ enum class SyncOption(val description: String) {
     SYNC_OFF("关闭同步");
 
     companion object {
-        fun fromInt(value: Int) = entries.first { it.ordinal == value }
+        fun fromInt(value: Int): SyncOption = entries.firstOrNull { it.ordinal == value } ?: SYNC_OFF
     }
 }
