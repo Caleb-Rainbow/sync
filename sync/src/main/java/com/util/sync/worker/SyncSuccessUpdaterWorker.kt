@@ -26,7 +26,7 @@ class SyncSuccessUpdaterWorker(
 ) : CoroutineWorker(context, params) {
 
     private val logDateFormatter by lazy {
-        java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
+        java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
     }
 
     private val utcZone = java.time.ZoneOffset.UTC

@@ -10,16 +10,10 @@ import androidx.work.WorkManager
 import androidx.work.workDataOf
 import com.github.yitter.idgen.YitIdHelper
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import java.util.concurrent.TimeUnit
 import kotlin.jvm.java
 import kotlin.to
-
-/**
- * 全局同步工作名称，用于互斥。
- * 手动同步和自动同步都使用同一个 unique work name，
- * 通过 [ExistingWorkPolicy.APPEND_OR_REPLACE] 保证不会并发执行。
- */
-const val GLOBAL_SYNC_WORK_NAME = "global_sync_work"
 
 /**
  * @description 同步工作管理器，负责调度同步 Worker
@@ -66,10 +60,11 @@ class SyncWorkManager(val context: Context) {
 
     /**
      * 检查当前是否有同步任务正在执行。
+     * 挂起函数，避免阻塞调用线程。
      */
-    fun isSyncRunning(): Boolean {
+    suspend fun isSyncRunning(): Boolean {
         val workManager = WorkManager.getInstance(context)
-        val workInfos = workManager.getWorkInfosForUniqueWork(GLOBAL_SYNC_WORK_NAME).get()
+        val workInfos = workManager.getWorkInfosForUniqueWorkFlow(GLOBAL_SYNC_WORK_NAME).first()
         return workInfos.any { it.state == WorkInfo.State.RUNNING }
     }
 

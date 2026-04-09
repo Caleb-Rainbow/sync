@@ -16,12 +16,15 @@ import com.util.sync.KEY_LAST_SYNC_TIME
 import com.util.sync.KEY_SYNC_SESSION_ID
 import com.util.sync.KEY_SYNC_START_TIME
 import com.util.sync.SyncConfigProvider
+import com.util.sync.SyncTimeUtils
+import com.util.sync.SyncTaskDefinition
 import com.util.sync.log.libLogD
 import com.util.sync.log.libLogE
 import com.util.sync.log.libLogI
 import com.util.sync.log.libLogW
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import java.util.Locale
@@ -31,11 +34,12 @@ import kotlin.reflect.KClass
 /**
  * 同步协调器工作器
  * 负责调度和编排所有同步任务，顺序执行每个任务
- * 
+ *
  * 设计原则：
  * 1. 任务顺序执行，避免并发带来的性能问题
  * 2. 单个任务失败不影响后续任务的执行
- * 3. 只有所有任务都成功时，才触发 SyncSuccessUpdaterWorker 更新同步时间戳
+ * 3. 失败任务在协调器内部重试（仅重试失败的任务，跳过已成功的）
+ * 4. 只有所有任务都成功时，才触发 SyncSuccessUpdaterWorker 更新同步时间戳
  */
 class SyncCoordinatorWorker(
     private val context: Context,
@@ -46,26 +50,21 @@ class SyncCoordinatorWorker(
     companion object {
         private const val TIMEOUT_THRESHOLD_MS = 5 * 60 * 1000L // 5分钟超时阈值
         private const val MAX_RETRY_COUNT = 3 // 最大重试次数
-        private val UTC_ZONE = java.time.ZoneOffset.UTC
-        private const val KEY_SUCCEEDED_WORKERS = "KEY_SUCCEEDED_WORKERS"
-        private const val SEPARATOR = ","
-    }
-
-    private val logDateFormatter by lazy {
-        java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
-    }
-
-    private val fallbackDateFormatter by lazy {
-        java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+        private const val RETRY_BASE_DELAY_MS = 30_000L // 重试基础延迟（毫秒）
     }
 
     /**
      * 将 epoch 毫秒格式化为 UTC 时间字符串，用于日志输出。
      */
     private fun formatTimestamp(timeMs: Long): String =
-        java.time.Instant.ofEpochMilli(timeMs)
-            .atZone(UTC_ZONE)
-            .format(logDateFormatter)
+        SyncTimeUtils.formatTimestamp(timeMs)
+
+    /**
+     * 解析上次同步时间字符串为 epoch 毫秒。
+     * 委托给 SyncTimeUtils 统一处理。
+     */
+    private fun parseLastSyncTime(time: String): Long =
+        SyncTimeUtils.parseUpdateTime(time) ?: 0L
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
@@ -75,7 +74,6 @@ class SyncCoordinatorWorker(
         libLogI("🎯 同步协调器开始")
         libLogI("  工作ID: $workerId")
         libLogI("  开始时间: ${formatTimestamp(startTime)}")
-        libLogI("  重试次数: $runAttemptCount/$MAX_RETRY_COUNT")
         libLogI("════════════════════════════════════════")
 
         // 检查用户登录状态
@@ -87,7 +85,9 @@ class SyncCoordinatorWorker(
 
         libLogI("👤 当前用户: ${syncConfigProvider.username}")
 
-        val syncStartTime = getCurrentTime()
+        val syncStartTime = SyncTimeUtils.run {
+            java.time.LocalDateTime.now(UTC_ZONE).format(STANDARD_FORMATTER)
+        }
         val lastSyncTime = syncConfigProvider.syncDataTime
 
         libLogI("📅 同步时间信息:")
@@ -135,92 +135,99 @@ class SyncCoordinatorWorker(
             return@withContext Result.success()
         }
 
-        // 从 inputData 中恢复上一次已成功的 Worker 类名列表（重试时跳过）
-        val previousSucceededClasses = parseSucceededWorkersFromInput()
-        if (previousSucceededClasses.isNotEmpty()) {
-            libLogI("🔄 重试模式: 跳过已成功的 ${previousSucceededClasses.size} 个任务")
-            previousSucceededClasses.forEach { libLogD("  ✓ 已跳过: $it") }
-        }
+        libLogI("🔧 开始执行任务:")
+        libLogI("  执行策略: 顺序执行，内部重试仅针对失败任务")
+        libLogI("────────────────────────────────────────")
 
-        // 筛选出需要执行的任务（排除已成功的）
-        val pendingTasks = allTasks.filter { task ->
-            task.workerClass.java.name !in previousSucceededClasses
-        }
-
-        if (pendingTasks.isEmpty()) {
-            libLogI("📋 所有任务已在前次执行中成功，无需重新执行")
-        } else {
-            libLogI("🔧 开始顺序执行任务:")
-            libLogI("  待执行: ${pendingTasks.size}，跳过(已成功): ${previousSucceededClasses.size}")
-            libLogD("  执行策略: 顺序执行，单个失败不阻塞后续任务")
-            libLogI("────────────────────────────────────────")
-        }
-
-        // 记录每个任务的执行结果
+        // 记录所有任务的执行结果
         data class TaskResult(
             val taskName: String,
             val workerClassName: String,
+            val task: SyncTaskDefinition,
             val success: Boolean,
             val durationMs: Long,
             val errorMessage: String? = null
         )
 
-        val taskResults = mutableListOf<TaskResult>()
-        var allTasksSucceeded = true
+        val allTaskResults = mutableListOf<TaskResult>()
+        var remainingTasks = allTasks.toList()
+        var allTasksSucceeded = false
 
-        // 顺序执行每个任务
-        for ((index, task) in pendingTasks.withIndex()) {
-            val taskStartTime = System.currentTimeMillis()
-            val taskName = task.title
-            val workerClassName = task.workerClass.simpleName ?: "Unknown"
+        // 内部重试循环：仅重试失败的任务，跳过已成功的
+        for (attempt in 0..MAX_RETRY_COUNT) {
+            if (attempt > 0) {
+                val delayMs = RETRY_BASE_DELAY_MS * (1L shl (attempt - 1))
+                libLogI("🔄 第 $attempt 次重试，等待 ${delayMs / 1000}s 后重试 ${remainingTasks.size} 个失败任务...")
+                delay(delayMs)
+            }
 
-            libLogI("📌 [${index + 1}/${pendingTasks.size}] 开始执行: $taskName")
-            libLogD("  Worker: $workerClassName")
+            libLogI("📌 ${if (attempt == 0) "首次执行" else "第 $attempt 次重试"}: ${remainingTasks.size} 个任务")
 
-            try {
-                // 创建并入队单个任务
-                val workRequest = createOneTimeWork(task.workerClass, lastSyncTime, sessionId)
+            val attemptResults = mutableListOf<TaskResult>()
 
-                // 入队任务（不需要等待入队完成，直接监听任务状态）
-                workManager.enqueue(workRequest)
+            for ((index, task) in remainingTasks.withIndex()) {
+                val taskStartTime = System.currentTimeMillis()
+                val taskName = task.title
+                val workerClassName = task.workerClass.simpleName ?: "Unknown"
 
-                // 使用 Flow 等待任务完成（阻塞直到任务进入终态）
-                val workInfo = workManager.getWorkInfoByIdFlow(workRequest.id)
-                    .first { it != null && it.state.isFinished }
-                val taskDuration = System.currentTimeMillis() - taskStartTime
+                libLogI("  [${index + 1}/${remainingTasks.size}] 开始执行: $taskName")
 
-                when (workInfo?.state) {
-                    WorkInfo.State.SUCCEEDED -> {
-                        libLogI("  ✅ 任务成功: $taskName, 耗时: ${taskDuration}ms")
-                        taskResults.add(TaskResult(taskName, workerClassName, true, taskDuration))
+                try {
+                    // 创建并入队单个任务
+                    val workRequest = createOneTimeWork(task.workerClass, lastSyncTime, sessionId)
+                    workManager.enqueue(workRequest)
+
+                    // 使用 Flow 等待任务完成（阻塞直到任务进入终态）
+                    val workInfo = workManager.getWorkInfoByIdFlow(workRequest.id)
+                        .first { it != null && it.state.isFinished }
+                    val taskDuration = System.currentTimeMillis() - taskStartTime
+
+                    when (workInfo?.state) {
+                        WorkInfo.State.SUCCEEDED -> {
+                            libLogI("    ✅ 任务成功: $taskName, 耗时: ${taskDuration}ms")
+                            attemptResults.add(TaskResult(taskName, workerClassName, task, true, taskDuration))
+                        }
+                        WorkInfo.State.FAILED -> {
+                            val errorMsg = workInfo.outputData.getString("failMessage") ?: "未知错误"
+                            libLogE("    ❌ 任务失败: $taskName, 耗时: ${taskDuration}ms")
+                            libLogE("      错误信息: $errorMsg")
+                            attemptResults.add(TaskResult(taskName, workerClassName, task, false, taskDuration, errorMsg))
+                        }
+                        WorkInfo.State.CANCELLED -> {
+                            libLogW("    ⚠️ 任务被取消: $taskName, 耗时: ${taskDuration}ms")
+                            attemptResults.add(TaskResult(taskName, workerClassName, task, false, taskDuration, "任务被取消"))
+                        }
+                        else -> {
+                            libLogW("    ⚠️ 任务状态异常: $taskName, 状态: ${workInfo?.state}, 耗时: ${taskDuration}ms")
+                            attemptResults.add(TaskResult(taskName, workerClassName, task, false, taskDuration, "状态异常: ${workInfo?.state}"))
+                        }
                     }
-                    WorkInfo.State.FAILED -> {
-                        val errorMsg = workInfo.outputData.getString("failMessage") ?: "未知错误"
-                        libLogE("  ❌ 任务失败: $taskName, 耗时: ${taskDuration}ms")
-                        libLogE("    错误信息: $errorMsg")
-                        taskResults.add(TaskResult(taskName, workerClassName, false, taskDuration, errorMsg))
-                        allTasksSucceeded = false
-                    }
-                    WorkInfo.State.CANCELLED -> {
-                        libLogW("  ⚠️ 任务被取消: $taskName, 耗时: ${taskDuration}ms")
-                        taskResults.add(TaskResult(taskName, workerClassName, false, taskDuration, "任务被取消"))
-                        allTasksSucceeded = false
-                    }
-                    else -> {
-                        libLogW("  ⚠️ 任务状态异常: $taskName, 状态: ${workInfo?.state}, 耗时: ${taskDuration}ms")
-                        taskResults.add(TaskResult(taskName, workerClassName, false, taskDuration, "状态异常: ${workInfo?.state}"))
-                        allTasksSucceeded = false
-                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    val taskDuration = System.currentTimeMillis() - taskStartTime
+                    libLogE("    💥 任务执行异常: $taskName", e)
+                    libLogE("      异常类型: ${e.javaClass.simpleName}")
+                    libLogE("      异常信息: ${e.message}")
+                    attemptResults.add(TaskResult(taskName, workerClassName, task, false, taskDuration, e.message))
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                val taskDuration = System.currentTimeMillis() - taskStartTime
-                libLogE("  💥 任务执行异常: $taskName", e)
-                libLogE("    异常类型: ${e.javaClass.simpleName}")
-                libLogE("    异常信息: ${e.message}")
-                taskResults.add(TaskResult(taskName, workerClassName, false, taskDuration, e.message))
-                allTasksSucceeded = false
+            }
+
+            allTaskResults.addAll(attemptResults)
+
+            val failedResults = attemptResults.filter { !it.success }
+            if (failedResults.isEmpty()) {
+                allTasksSucceeded = true
+                break
+            }
+
+            if (attempt < MAX_RETRY_COUNT) {
+                val failedNames = failedResults.map { it.taskName }.toSet()
+                remainingTasks = remainingTasks.filter { it.title in failedNames }
+                libLogW("  ⚠️ ${failedResults.size} 个任务失败，将在重试时跳过已成功的任务")
+            } else {
+                libLogW("  ❌ 已达到最大重试次数 ($MAX_RETRY_COUNT)，以下任务仍然失败:")
+                failedResults.forEach { libLogW("    - ${it.taskName}: ${it.errorMessage}") }
             }
 
             libLogD("────────────────────────────────────────")
@@ -229,11 +236,11 @@ class SyncCoordinatorWorker(
         // 输出任务执行汇总
         libLogI("════════════════════════════════════════")
         libLogI("📊 任务执行汇总:")
-        val successCount = taskResults.count { it.success }
-        val failCount = taskResults.count { !it.success }
-        libLogI("  成功: $successCount, 失败: $failCount, 总计: ${taskResults.size}")
+        val successCount = allTaskResults.count { it.success }
+        val failCount = allTaskResults.count { !it.success }
+        libLogI("  成功: $successCount, 失败: $failCount, 总计: ${allTaskResults.size}")
 
-        taskResults.forEachIndexed { index, result ->
+        allTaskResults.forEachIndexed { index, result ->
             val statusIcon = if (result.success) "✅" else "❌"
             libLogI("  [$statusIcon] ${result.taskName}: ${result.durationMs}ms")
             if (!result.success && result.errorMessage != null) {
@@ -285,70 +292,7 @@ class SyncCoordinatorWorker(
         libLogI("  最终状态: ${if (allTasksSucceeded) "全部成功" else "部分失败"}")
         libLogI("════════════════════════════════════════")
 
-        // 协调器根据任务结果决定返回值
-        // 存在失败任务时返回 retry，让 WorkManager 按退避策略自动重试
-        // 超过最大重试次数后返回 failure，避免无限重试
-        // 将已成功的 Worker 类名列表附加到 outputData，供重试时跳过
-        return@withContext if (allTasksSucceeded) {
-            Result.success()
-        } else if (runAttemptCount < MAX_RETRY_COUNT) {
-            // 收集本次已成功的 Worker 类名 + 之前已成功的
-            val succeededWorkers = (previousSucceededClasses +
-                    taskResults.filter { it.success }.map { it.workerClassName })
-                .distinct()
-                .joinToString(SEPARATOR)
-
-            libLogI("  ⚠️ 存在失败任务 (重试 ${runAttemptCount + 1}/$MAX_RETRY_COUNT)，协调器返回 retry")
-            Result.retry()
-        } else {
-            libLogW("  ❌ 已达到最大重试次数 ($MAX_RETRY_COUNT)，协调器返回 failure")
-            Result.failure()
-        }
-    }
-
-    /**
-     * 从 inputData 中解析上一次已成功的 Worker 类名列表。
-     * 注意：WorkManager retry 时 inputData 保持不变，无法通过 inputData 传递重试状态。
-     * 因此重试时会重新执行所有任务（依赖子任务的幂等性保证安全性）。
-     */
-    private fun parseSucceededWorkersFromInput(): Set<String> {
-        val inputStr = inputData.getString(KEY_SUCCEEDED_WORKERS) ?: ""
-        return inputStr.split(SEPARATOR).filter { it.isNotBlank() }.toSet()
-    }
-
-    fun getCurrentTime(): String =
-        java.time.LocalDateTime.now(UTC_ZONE).format(logDateFormatter)
-
-    /**
-     * 解析上次同步时间字符串为 epoch 毫秒。
-     * 优先按 UTC 解析，失败后回退到系统时区（兼容旧数据）。
-     */
-    private fun parseLastSyncTime(time: String): Long {
-        // 优先 UTC
-        try {
-            return java.time.LocalDateTime.parse(time, logDateFormatter)
-                .toInstant(UTC_ZONE)
-                .toEpochMilli()
-        } catch (_: Exception) { }
-        try {
-            return java.time.LocalDateTime.parse(time, fallbackDateFormatter)
-                .toInstant(UTC_ZONE)
-                .toEpochMilli()
-        } catch (_: Exception) { }
-        // 回退系统时区
-        try {
-            return java.time.LocalDateTime.parse(time, logDateFormatter)
-                .atZone(java.time.ZoneId.systemDefault())
-                .toInstant()
-                .toEpochMilli()
-        } catch (_: Exception) { }
-        try {
-            return java.time.LocalDateTime.parse(time, fallbackDateFormatter)
-                .atZone(java.time.ZoneId.systemDefault())
-                .toInstant()
-                .toEpochMilli()
-        } catch (_: Exception) { }
-        return 0L
+        return@withContext if (allTasksSucceeded) Result.success() else Result.failure()
     }
 
     /**

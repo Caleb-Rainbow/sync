@@ -18,6 +18,13 @@ extensions.configure<LibraryExtension>("android") {
         consumerProguardFiles("consumer-rules.pro")
     }
 
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            isReturnDefaultValues = true
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -48,7 +55,7 @@ publishing {
         create<MavenPublication>("release") {
             groupId = "com.github.Caleb-Rainbow"
             artifactId = "sync"
-            version = "2026.03.14.01"
+            version = "2026.04.09.01"
 
             afterEvaluate {
                 from(components["release"])
@@ -64,4 +71,10 @@ dependencies {
     //work
     api(libs.androidx.work)
     api(libs.network)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.coroutines.test)
+    testImplementation(libs.mockk)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.work.testing)
 }

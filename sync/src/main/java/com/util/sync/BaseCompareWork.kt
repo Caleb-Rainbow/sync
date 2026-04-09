@@ -2,7 +2,6 @@ package com.util.sync
 
 import android.content.Context
 import androidx.work.CoroutineWorker
-import androidx.work.Data
 import androidx.work.WorkerParameters
 import com.github.yitter.idgen.YitIdHelper
 import com.util.sync.log.libLogD
@@ -24,34 +23,10 @@ import java.util.Locale
 /**
  * 数据同步基类
  * 负责设备与服务器之间的双向数据同步，支持多种同步模式
- * 
+ *
  * @param T 同步实体类型，必须实现 SyncableEntity 接口
  * @param R 仓库类型，必须实现 SyncRepository<T> 接口
  */
-const val KEY_LAST_SYNC_TIME = "KEY_LAST_SYNC_TIME"
-const val KEY_SYNC_START_TIME = "KEY_SYNC_START_TIME"
-const val KEY_SYNC_SESSION_ID = "KEY_SYNC_SESSION_ID"
-
-/**
- * 同步统计数据类（可变计数器）
- * 用于在同步过程中统计各项操作的计数。
- * 虽然使用 var 字段，但仅在单一线程的顺序处理流程中使用，不涉及并发修改。
- */
-class SyncStats {
-    var downloaded: Int = 0; private set
-    var uploaded: Int = 0; private set
-    var skipped: Int = 0; private set
-    var failedFetch: Int = 0; private set
-
-    fun recordDownload() { downloaded++ }
-    fun recordUpload() { uploaded++ }
-    fun recordSkip() { skipped++ }
-    fun recordFailedFetch() { failedFetch++ }
-
-    override fun toString(): String =
-        "SyncStats(downloaded=$downloaded, uploaded=$uploaded, skipped=$skipped, failedFetch=$failedFetch)"
-}
-
 abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
     context: Context,
     workerParameters: WorkerParameters,
@@ -61,15 +36,6 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
         private const val TIMEOUT_THRESHOLD_MS = 5 * 60 * 1000L // 5分钟超时阈值
         private const val TIME_SKEW_THRESHOLD_MS = 3000L // 3秒时钟偏差容忍阈值
         private const val MAX_ID_QUERY_CONCURRENCY = 8 // ID 单查模式最大并发请求数
-
-        /** UTC 标准格式，带毫秒和时区偏移量 */
-        private val UTC_FORMATTER by lazy {
-            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
-        }
-        private val UTC_FALLBACK_FORMATTER by lazy {
-            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-        }
-        private val UTC_ZONE = java.time.ZoneOffset.UTC
     }
 
     // --- 由子类提供的抽象属性 ---
@@ -87,50 +53,13 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
      * 将 epoch 毫秒格式化为 UTC 时间字符串（带毫秒），用于日志输出。
      * 使用 UTC 避免设备时区变更导致的时间错乱。
      */
-    private fun formatTimestamp(timeMs: Long): String =
-        java.time.Instant.ofEpochMilli(timeMs)
-            .atZone(UTC_ZONE)
-            .format(UTC_FORMATTER)
+    private fun formatTimestamp(timeMs: Long): String = SyncTimeUtils.formatTimestamp(timeMs)
 
     /**
      * 将 updateTime 字符串解析为 epoch 毫秒数，用于可靠的数值比较。
-     * 兼容两种格式：带毫秒("yyyy-MM-dd HH:mm:ss.SSS")和不带毫秒("yyyy-MM-dd HH:mm:ss")。
-     * 优先按 UTC 解析；若失败，回退到系统时区（兼容旧数据）。
-     * 解析失败返回 null，调用方需处理解析失败的情况。
+     * 委托给 [SyncTimeUtils.parseUpdateTime]。
      */
-    private fun parseUpdateTime(time: String): Long? {
-        return try {
-            // 优先按 UTC 解析
-            java.time.LocalDateTime.parse(time, UTC_FORMATTER)
-                .toInstant(UTC_ZONE)
-                .toEpochMilli()
-        } catch (_: Exception) {
-            try {
-                // 回退到不带毫秒的 UTC 格式
-                java.time.LocalDateTime.parse(time, UTC_FALLBACK_FORMATTER)
-                    .toInstant(UTC_ZONE)
-                    .toEpochMilli()
-            } catch (_: Exception) {
-                try {
-                    // 最后回退：按系统时区解析（兼容旧版本生成的数据）
-                    java.time.LocalDateTime.parse(time, UTC_FORMATTER)
-                        .atZone(java.time.ZoneId.systemDefault())
-                        .toInstant()
-                        .toEpochMilli()
-                } catch (_: Exception) {
-                    try {
-                        java.time.LocalDateTime.parse(time, UTC_FALLBACK_FORMATTER)
-                            .atZone(java.time.ZoneId.systemDefault())
-                            .toInstant()
-                            .toEpochMilli()
-                    } catch (e: Exception) {
-                        libLogE("updateTime 解析失败: $time, ${e.message}")
-                        null
-                    }
-                }
-            }
-        }
-    }
+    private fun parseUpdateTime(time: String): Long? = SyncTimeUtils.parseUpdateTime(time)
 
     // --- 用于特殊处理的钩子方法，子类可以重写 ---
 
@@ -768,6 +697,3 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
         return truncated.joinToString(prefix = "[", postfix = "$suffix]")
     }
 }
-
-fun createSuccessData(message: String) = Data.Builder().putString("successMessage", message).build()
-fun createFailData(message: String) = Data.Builder().putString("failMessage", message).build()
