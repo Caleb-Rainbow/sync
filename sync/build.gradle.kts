@@ -4,7 +4,6 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 plugins {
     id("maven-publish")
     id("com.android.library")
-    id("org.jetbrains.kotlin.android")
 }
 
 extensions.configure<LibraryExtension>("android") {
