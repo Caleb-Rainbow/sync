@@ -24,7 +24,7 @@ class SyncWorkManager(val context: Context) {
 
     /**
      * 启动一个带唯一动态标签的 Worker，并返回一个只观察该 Worker 的 Flow。
-     * 使用全局唯一工作名 [GLOBAL_SYNC_WORK_NAME] 保证手动同步之间互斥。
+     * 每种 Worker 使用独立的唯一工作名，避免不同任务之间互相清理 WorkSpec。
      */
     inline fun <reified W : ListenableWorker> enqueueAndObserveUniqueRequest(
         lastSyncTime: String,
@@ -37,6 +37,7 @@ class SyncWorkManager(val context: Context) {
 
         val workRequest = OneTimeWorkRequestBuilder<W>()
             .addTag(uniqueTag)
+            .addTag(GLOBAL_SYNC_WORK_NAME)
             .setInputData(
                 workDataOf(
                     KEY_LAST_SYNC_TIME to lastSyncTime,
@@ -46,11 +47,12 @@ class SyncWorkManager(val context: Context) {
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
 
-        // 2. 使用全局唯一工作名入队，防止手动同步之间并发重复执行
-        // APPEND_OR_REPLACE: 如果有已完成的同名工作则替换，如果有正在执行的同名工作则排队等待
+        // 2. 每个 Worker 类型使用独立的唯一工作名
+        // 避免 APPEND_OR_REPLACE 在新任务入队时删除已完成任务的 WorkSpec
+        val uniqueWorkName = "${GLOBAL_SYNC_WORK_NAME}_${W::class.java.name}"
         workManager.enqueueUniqueWork(
-            GLOBAL_SYNC_WORK_NAME,
-            ExistingWorkPolicy.APPEND_OR_REPLACE,
+            uniqueWorkName,
+            ExistingWorkPolicy.REPLACE,
             workRequest
         )
 
@@ -60,11 +62,11 @@ class SyncWorkManager(val context: Context) {
 
     /**
      * 检查当前是否有同步任务正在执行。
-     * 挂起函数，避免阻塞调用线程。
+     * 通过公共标签 [GLOBAL_SYNC_WORK_NAME] 查询所有同步任务。
      */
     suspend fun isSyncRunning(): Boolean {
         val workManager = WorkManager.getInstance(context)
-        val workInfos = workManager.getWorkInfosForUniqueWorkFlow(GLOBAL_SYNC_WORK_NAME).first()
+        val workInfos = workManager.getWorkInfosByTagFlow(GLOBAL_SYNC_WORK_NAME).first()
         return workInfos.any { it.state == WorkInfo.State.RUNNING }
     }
 
@@ -73,6 +75,6 @@ class SyncWorkManager(val context: Context) {
      */
     fun cancelAllSync() {
         val workManager = WorkManager.getInstance(context)
-        workManager.cancelUniqueWork(GLOBAL_SYNC_WORK_NAME)
+        workManager.cancelAllWorkByTag(GLOBAL_SYNC_WORK_NAME)
     }
 }
