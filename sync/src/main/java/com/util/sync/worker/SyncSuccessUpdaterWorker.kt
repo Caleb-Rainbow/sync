@@ -29,11 +29,9 @@ class SyncSuccessUpdaterWorker(
         java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
     }
 
-    private val utcZone = java.time.ZoneOffset.UTC
-
     private fun formatTimestamp(timeMs: Long): String =
         java.time.Instant.ofEpochMilli(timeMs)
-            .atZone(utcZone)
+            .atZone(java.time.ZoneId.systemDefault())
             .format(logDateFormatter)
 
     override suspend fun doWork() = withContext(Dispatchers.IO) {

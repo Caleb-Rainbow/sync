@@ -29,40 +29,40 @@ object SyncTimeUtils {
     val UTC_ZONE: ZoneOffset = ZoneOffset.UTC
 
     /**
-     * 将 epoch 毫秒格式化为 UTC 时间字符串（不带毫秒），用于日志输出和时间戳生成。
+     * 将 epoch 毫秒格式化为本地时间字符串（不带毫秒），用于日志输出和时间戳生成。
      */
     fun formatTimestamp(timeMs: Long): String =
         java.time.Instant.ofEpochMilli(timeMs)
-            .atZone(UTC_ZONE)
+            .atZone(ZoneId.systemDefault())
             .format(STANDARD_FORMATTER)
 
     /**
      * 将 updateTime 字符串解析为 epoch 毫秒数，用于可靠的数值比较。
      * 兼容两种格式：带毫秒和不带毫秒。
-     * 优先按 UTC 解析；若失败，回退到系统时区（兼容旧数据）。
+     * 优先按系统时区解析；若失败，回退到 UTC（兼容旧数据）。
      * 解析失败返回 null。
      */
     fun parseUpdateTime(time: String): Long? {
         return try {
             java.time.LocalDateTime.parse(time, PARSE_FORMATTER_WITH_MS)
-                .toInstant(UTC_ZONE)
+                .atZone(ZoneId.systemDefault())
+                .toInstant()
                 .toEpochMilli()
         } catch (_: Exception) {
             try {
                 java.time.LocalDateTime.parse(time, STANDARD_FORMATTER)
-                    .toInstant(UTC_ZONE)
+                    .atZone(ZoneId.systemDefault())
+                    .toInstant()
                     .toEpochMilli()
             } catch (_: Exception) {
                 try {
                     java.time.LocalDateTime.parse(time, PARSE_FORMATTER_WITH_MS)
-                        .atZone(ZoneId.systemDefault())
-                        .toInstant()
+                        .toInstant(UTC_ZONE)
                         .toEpochMilli()
                 } catch (_: Exception) {
                     try {
                         java.time.LocalDateTime.parse(time, STANDARD_FORMATTER)
-                            .atZone(ZoneId.systemDefault())
-                            .toInstant()
+                            .toInstant(UTC_ZONE)
                             .toEpochMilli()
                     } catch (_: Exception) {
                         null

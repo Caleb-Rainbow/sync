@@ -25,6 +25,11 @@ interface SyncConfigProvider {
     var deviceNumber: String
     var batchSize: Int
     /**
+     * 上传到服务器时每批的最大数量，用于分批上传。
+     * 默认 200，对应后端批量上传接口的单次限制。
+     */
+    var uploadBatchSize: Int
+    /**
      * 当前同步模式，批量还是根据id单查
      * 0-id单查  1-批量
      * */
@@ -52,6 +57,7 @@ abstract class AbstractSyncConfigProvider : SyncConfigProvider {
     private val _heartbeatPeriod = AtomicInteger(0)
     private val _deviceNumber = AtomicReference("")
     private val _batchSize = AtomicInteger(100)
+    private val _uploadBatchSize = AtomicInteger(200)
     private val _syncMode = AtomicInteger(1)
 
     override var username: String
@@ -81,6 +87,10 @@ abstract class AbstractSyncConfigProvider : SyncConfigProvider {
     override var batchSize: Int
         get() = _batchSize.get()
         set(value) { _batchSize.set(value) }
+
+    override var uploadBatchSize: Int
+        get() = _uploadBatchSize.get()
+        set(value) { _uploadBatchSize.set(value) }
 
     override var syncMode: Int
         get() = _syncMode.get()

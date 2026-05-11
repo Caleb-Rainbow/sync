@@ -16,24 +16,24 @@ class SyncTimeUtilsTest {
     // ═══════════════════════════════════════════════════════════
 
     @Test
-    fun `parseUpdateTime with milliseconds UTC`() {
+    fun `parseUpdateTime with milliseconds`() {
         val time = "2026-01-15 10:30:45.123"
         val result = SyncTimeUtils.parseUpdateTime(time)
         assertNotNull(result)
 
         val expected = LocalDateTime.parse(time, SyncTimeUtils.PARSE_FORMATTER_WITH_MS)
-            .toInstant(ZoneOffset.UTC).toEpochMilli()
+            .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
         assertEquals(expected, result)
     }
 
     @Test
-    fun `parseUpdateTime without milliseconds UTC`() {
+    fun `parseUpdateTime without milliseconds`() {
         val time = "2026-01-15 10:30:45"
         val result = SyncTimeUtils.parseUpdateTime(time)
         assertNotNull(result)
 
         val expected = LocalDateTime.parse(time, SyncTimeUtils.STANDARD_FORMATTER)
-            .toInstant(ZoneOffset.UTC).toEpochMilli()
+            .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
         assertEquals(expected, result)
     }
 
@@ -42,21 +42,19 @@ class SyncTimeUtilsTest {
     // ═══════════════════════════════════════════════════════════
 
     @Test
-    fun `parseUpdateTime epoch zero`() {
-        val time = "1970-01-01 00:00:00.000"
-        val result = SyncTimeUtils.parseUpdateTime(time)
+    fun `parseUpdateTime epoch zero round trip`() {
+        val formatted = SyncTimeUtils.formatTimestamp(0L)
+        val result = SyncTimeUtils.parseUpdateTime(formatted)
         assertNotNull(result)
-        assertEquals(0L, result)
+        assertTrue("Expected near 0, got $result", kotlin.math.abs(result!!) < 1000)
     }
 
     @Test
-    fun `parseUpdateTime one second before epoch`() {
-        // 1969 不在 UTC LocalDateTime 范围内，但格式合法
-        val time = "1969-12-31 23:59:59.000"
-        val result = SyncTimeUtils.parseUpdateTime(time)
-        // 这个时间在 UTC 下是负值，parseUpdateTime 应该能解析
+    fun `parseUpdateTime one second before epoch round trip`() {
+        val formatted = SyncTimeUtils.formatTimestamp(-1000L)
+        val result = SyncTimeUtils.parseUpdateTime(formatted)
         assertNotNull(result)
-        assertEquals(-1000L, result)
+        assertTrue("Expected near -1000, got $result", kotlin.math.abs(result!! + 1000L) < 1000)
     }
 
     @Test
@@ -340,13 +338,19 @@ class SyncTimeUtilsTest {
     @Test
     fun `formatTimestamp epoch zero`() {
         val result = SyncTimeUtils.formatTimestamp(0L)
-        assertEquals("1970-01-01 00:00:00", result)
+        val expected = java.time.Instant.EPOCH
+            .atZone(ZoneId.systemDefault())
+            .format(SyncTimeUtils.STANDARD_FORMATTER)
+        assertEquals(expected, result)
     }
 
     @Test
     fun `formatTimestamp negative timestamp`() {
         val result = SyncTimeUtils.formatTimestamp(-1000L)
-        assertEquals("1969-12-31 23:59:59", result)
+        val expected = java.time.Instant.ofEpochMilli(-1000L)
+            .atZone(ZoneId.systemDefault())
+            .format(SyncTimeUtils.STANDARD_FORMATTER)
+        assertEquals(expected, result)
     }
 
     @Test

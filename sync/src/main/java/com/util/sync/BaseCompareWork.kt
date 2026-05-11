@@ -528,24 +528,35 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
     ) {
         libLogI("💾 步骤: 批量数据更新")
 
-        // 上传到服务器
-        var remoteUploadSucceeded = false
-        if (updatedRemoteData.isNotEmpty()) {
-            libLogI("  ☁️ 正在上传 ${updatedRemoteData.size} 个项目到服务器...")
-            val uploadStartTime = System.currentTimeMillis()
-            val remotePutResult = repository.remoteBatchUpsert(updatedRemoteData)
-            val uploadDuration = System.currentTimeMillis() - uploadStartTime
+        // 分批上传到服务器
+        val successfulUploadIds = mutableSetOf<Long>()
+        var hasSuccessfulUpload = updatedRemoteData.isEmpty()
 
-            if (remotePutResult.isError()) {
-                libLogE("  ❌ 批量上传失败: ${remotePutResult.message}")
-                failureMessages.add("批量上传失败: ${remotePutResult.message}")
-            } else {
-                remoteUploadSucceeded = true
-                libLogI("  ✅ 批量上传成功，数量: ${updatedRemoteData.size}，耗时: ${uploadDuration}ms")
+        if (updatedRemoteData.isNotEmpty()) {
+            val uploadBatchSize = syncConfig.uploadBatchSize.coerceAtLeast(1)
+            val batches = updatedRemoteData.chunked(uploadBatchSize)
+            libLogI("  ☁️ 正在上传 ${updatedRemoteData.size} 个项目到服务器，分 ${batches.size} 批（每批最多 $uploadBatchSize 个）...")
+            val uploadStartTime = System.currentTimeMillis()
+
+            for ((index, batch) in batches.withIndex()) {
+                val batchStartTime = System.currentTimeMillis()
+                val remotePutResult = repository.remoteBatchUpsert(batch)
+                val batchDuration = System.currentTimeMillis() - batchStartTime
+
+                if (remotePutResult.isError()) {
+                    libLogE("  ❌ 第 ${index + 1}/${batches.size} 批上传失败 (${batch.size} 个): ${remotePutResult.message}")
+                    failureMessages.add("批量上传失败(第${index + 1}/${batches.size}批): ${remotePutResult.message}")
+                } else {
+                    hasSuccessfulUpload = true
+                    batch.mapTo(successfulUploadIds) { it.id }
+                    libLogI("  ✅ 第 ${index + 1}/${batches.size} 批上传成功，数量: ${batch.size}，耗时: ${batchDuration}ms")
+                }
             }
-        } else {
-            // 没有需要上传的数据，视为成功
-            remoteUploadSucceeded = true
+
+            val uploadDuration = System.currentTimeMillis() - uploadStartTime
+            if (hasSuccessfulUpload) {
+                libLogI("  ✅ 上传完成，成功: ${successfulUploadIds.size}/${updatedRemoteData.size}，总耗时: ${uploadDuration}ms")
+            }
         }
 
         // 步骤 1: 始终写入来自服务端的数据到本地
@@ -565,34 +576,36 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
             }
         }
 
-        // 步骤 2: 仅在远程上传成功时，写入上传处理后的本地更新数据
+        // 步骤 2: 仅对上传成功的项，写入上传处理后的本地更新数据
         var localUploadUpdateSucceeded = true
-        if (remoteUploadSucceeded && updatedLocalDataFromUpload.isNotEmpty()) {
-            libLogI("  🗄️ 正在同步本地上传状态 ${updatedLocalDataFromUpload.size} 个项目...")
+        val filteredLocalDataFromUpload = updatedLocalDataFromUpload.filter { it.id in successfulUploadIds }
+        if (hasSuccessfulUpload && filteredLocalDataFromUpload.isNotEmpty()) {
+            libLogI("  🗄️ 正在同步本地上传状态 ${filteredLocalDataFromUpload.size} 个项目...")
             val uploadUpdateStartTime = System.currentTimeMillis()
             try {
-                repository.localBatchUpsert(updatedLocalDataFromUpload)
+                repository.localBatchUpsert(filteredLocalDataFromUpload)
                 val uploadUpdateDuration = System.currentTimeMillis() - uploadUpdateStartTime
-                libLogI("  ✅ 本地上传状态更新成功，数量: ${updatedLocalDataFromUpload.size}，耗时: ${uploadUpdateDuration}ms")
+                libLogI("  ✅ 本地上传状态更新成功，数量: ${filteredLocalDataFromUpload.size}，耗时: ${uploadUpdateDuration}ms")
             } catch (e: Exception) {
                 localUploadUpdateSucceeded = false
                 libLogE("  ❌ 本地上传状态更新失败: ${e.message}")
                 failureMessages.add("本地数据库更新失败(上传状态): ${e.message}")
             }
-        } else if (!remoteUploadSucceeded && updatedLocalDataFromUpload.isNotEmpty()) {
+        } else if (!hasSuccessfulUpload && updatedLocalDataFromUpload.isNotEmpty()) {
             localUploadUpdateSucceeded = false
             libLogW("  ⚠️ 远程上传失败，跳过 ${updatedLocalDataFromUpload.size} 个本地上传状态的更新，避免数据不一致")
         }
 
-        // 清理本地文件（分阶段清理，避免部分失败导致文件泄漏）
-        if (syncConfig.isDeleteLocalFile && filesToDeleteAfterSuccess.isNotEmpty()) {
-            // 只有当远程上传成功 + 上传状态本地更新成功时，才清理对应的上传文件
-            val canCleanupUploadFiles = remoteUploadSucceeded && localUploadUpdateSucceeded
+        // 清理本地文件（仅清理成功上传的项对应的文件）
+        val filteredFilesToDelete = filesToDeleteAfterSuccess.filterKeys { it in successfulUploadIds }
+        if (syncConfig.isDeleteLocalFile && filteredFilesToDelete.isNotEmpty()) {
+            val canCleanupUploadFiles = hasSuccessfulUpload && localUploadUpdateSucceeded
             if (canCleanupUploadFiles) {
-                cleanupLocalFiles(updatedRemoteData, filesToDeleteAfterSuccess)
+                val filteredRemoteData = updatedRemoteData.filter { it.id in successfulUploadIds }
+                cleanupLocalFiles(filteredRemoteData, filteredFilesToDelete)
             } else {
-                libLogW("  ⚠️ 跳过文件清理: 远程上传=${remoteUploadSucceeded}, 本地上传状态更新=${localUploadUpdateSucceeded}")
-                libLogW("  ⚠️ ${filesToDeleteAfterSuccess.size} 个本地文件暂不删除，将在下次成功同步后重试")
+                libLogW("  ⚠️ 跳过文件清理: 远程上传=${hasSuccessfulUpload}, 本地上传状态更新=${localUploadUpdateSucceeded}")
+                libLogW("  ⚠️ ${filteredFilesToDelete.size} 个本地文件暂不删除，将在下次成功同步后重试")
             }
         }
 

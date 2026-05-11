@@ -86,7 +86,7 @@ class SyncCoordinatorWorker(
         libLogI("👤 当前用户: ${syncConfigProvider.username}")
 
         val syncStartTime = SyncTimeUtils.run {
-            java.time.LocalDateTime.now(UTC_ZONE).format(STANDARD_FORMATTER)
+            java.time.LocalDateTime.now(java.time.ZoneId.systemDefault()).format(STANDARD_FORMATTER)
         }
         val lastSyncTime = syncConfigProvider.syncDataTime
 
