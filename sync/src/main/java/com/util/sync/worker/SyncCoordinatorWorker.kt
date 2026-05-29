@@ -3,7 +3,6 @@ package com.util.sync.worker
 import android.content.Context
 import androidx.work.BackoffPolicy
 import androidx.work.CoroutineWorker
-import androidx.work.Data
 import androidx.work.ListenableWorker
 import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
@@ -12,12 +11,13 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.github.yitter.idgen.YitIdHelper
+import com.util.sync.GLOBAL_SYNC_WORK_NAME
 import com.util.sync.KEY_LAST_SYNC_TIME
 import com.util.sync.KEY_SYNC_SESSION_ID
 import com.util.sync.KEY_SYNC_START_TIME
 import com.util.sync.SyncConfigProvider
-import com.util.sync.SyncTimeUtils
 import com.util.sync.SyncTaskDefinition
+import com.util.sync.SyncTimeUtils
 import com.util.sync.log.libLogD
 import com.util.sync.log.libLogE
 import com.util.sync.log.libLogI
@@ -27,7 +27,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
-import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.reflect.KClass
 
@@ -76,6 +75,16 @@ class SyncCoordinatorWorker(
         libLogI("  开始时间: ${formatTimestamp(startTime)}")
         libLogI("════════════════════════════════════════")
 
+        // 检查是否有同步任务正在运行（手动同步或其它自动同步），避免并发冲突
+        val workManager = WorkManager.getInstance(context)
+        val runningSyncs = workManager.getWorkInfosByTagFlow(GLOBAL_SYNC_WORK_NAME).first()
+            .filter { it.state == WorkInfo.State.RUNNING }
+        if (runningSyncs.isNotEmpty()) {
+            libLogW("⚠️ 检测到已有同步任务正在运行，自动同步退让")
+            libLogW("  运行中的任务数: ${runningSyncs.size}")
+            return@withContext Result.retry()
+        }
+
         // 检查用户登录状态
         if (syncConfigProvider.username.isEmpty()) {
             libLogW("⚠️ 用户未登录，协调任务终止")
@@ -94,6 +103,8 @@ class SyncCoordinatorWorker(
         libLogI("  上次同步时间: ${lastSyncTime.ifEmpty { "首次同步" }}")
         libLogI("  本次同步开始: $syncStartTime")
 
+        syncConfigProvider.lastSyncAttemptTime = syncStartTime
+
         // 检查距离上次同步是否超过15分钟（定期同步监控）
         if (lastSyncTime.isNotEmpty()) {
             try {
@@ -111,7 +122,6 @@ class SyncCoordinatorWorker(
             }
         }
 
-        val workManager = WorkManager.getInstance(context)
         val sessionId = "自动同步-${YitIdHelper.nextId()}"
 
         libLogI("🔑 会话ID: $sessionId")
@@ -313,6 +323,7 @@ class SyncCoordinatorWorker(
         libLogD("    sessionId: $sessionId")
 
         return OneTimeWorkRequest.Builder(workerClass.java)
+            .addTag(GLOBAL_SYNC_WORK_NAME)
             .setInputData(inputData)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()

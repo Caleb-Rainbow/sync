@@ -41,6 +41,11 @@ interface SyncConfigProvider {
      */
     fun saveSuccessfulSyncTime(time: String)
 
+    /**
+     * 最近一次同步尝试时间（无论成功或失败）。
+     */
+    var lastSyncAttemptTime: String
+
     fun getAllTask(): List<SyncTaskDefinition>
 }
 
@@ -59,6 +64,7 @@ abstract class AbstractSyncConfigProvider : SyncConfigProvider {
     private val _batchSize = AtomicInteger(100)
     private val _uploadBatchSize = AtomicInteger(200)
     private val _syncMode = AtomicInteger(1)
+    private val _lastSyncAttemptTime = AtomicReference("")
 
     override var username: String
         get() = _username.get()
@@ -95,6 +101,10 @@ abstract class AbstractSyncConfigProvider : SyncConfigProvider {
     override var syncMode: Int
         get() = _syncMode.get()
         set(value) { _syncMode.set(value) }
+
+    override var lastSyncAttemptTime: String
+        get() = _lastSyncAttemptTime.get()
+        set(value) { _lastSyncAttemptTime.set(value) }
 
     /**
      * 使用 CAS 保证时间戳只向前更新，避免并发写入导致回退。
