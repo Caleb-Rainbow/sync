@@ -32,4 +32,10 @@ interface SyncRepository<T : SyncableEntity> {
     suspend fun remoteBatchUpsert(data: List<T>): ResultModel<String> // 使用 Unit 表示只关心成功或失败
     // 本地批量更新或插入
     suspend fun localBatchUpsert(data: List<T>)
+
+    /** 清空本地表所有数据，用于"覆盖本地"模式下先清后插 */
+    suspend fun localDeleteAll()
+
+    /** 删除不在指定 ID 集合中的本地记录，用于"覆盖本地"模式下安全替换 */
+    suspend fun localDeleteAllExcept(retainedIds: Set<Long>)
 }

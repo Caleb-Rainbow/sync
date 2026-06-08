@@ -5,20 +5,19 @@ import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.github.yitter.idgen.YitIdHelper
 import com.util.sync.log.libLogD
-import com.util.sync.log.libLogDLazy
 import com.util.sync.log.libLogE
 import com.util.sync.log.libLogI
 import com.util.sync.log.libLogTag
 import com.util.sync.log.libLogW
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.Locale
 
 /**
  * 数据同步基类
@@ -44,6 +43,8 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
     abstract val syncOptionName: String
     abstract val repository: R
     abstract val syncOptionInt: Int
+    /** 当前实体的服务器下发模式：0-增量同步  1-覆盖本地 */
+    abstract val serverDownloadModeInt: Int
     abstract val syncConfig: SyncConfigProvider
 
     // 缓存 TAG，避免每次日志调用时通过反射获取类名
@@ -141,17 +142,194 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                 return@withContext Result.success(createSuccessData("同步已关闭，未执行任何操作。"))
             }
 
-            // 根据 syncMode 选择同步策略
+            // 根据同步选项和配置选择同步策略
             val syncMode = syncConfig.syncMode
-            libLogI("📍 同步策略: ${if (syncMode == 1) "批量模式" else "ID单查模式"}")
+            val isOverwriteMode = syncOption == SyncOption.SERVER_DOWNLOAD && serverDownloadModeInt == 1
+
+            if (isOverwriteMode) {
+                libLogI("📍 同步策略: 覆盖本地模式（全量获取 → 清空 → 写入）")
+            } else {
+                libLogI("📍 同步策略: ${if (syncMode == 1) "批量模式" else "ID单查模式"}")
+            }
             libLogI("────────────────────────────────────────────────────────")
 
-            return@withContext if (syncMode == 1) {
+            return@withContext if (isOverwriteMode) {
+                executeOverwriteMode(startTime, syncOption)
+            } else if (syncMode == 1) {
                 executeBatchMode(startTime, sessionId, lastSyncTime, syncOption)
             } else {
                 executeIdQueryMode(startTime, lastSyncTime, syncOption)
             }
         }
+    }
+
+    /**
+     * 覆盖本地模式：全量获取服务端数据，清空本地表后全量插入。
+     * 仅在 SyncOption.SERVER_DOWNLOAD 且 serverDownloadModeInt == 1 时调用。
+     * 根据 syncMode 选择 ID单查 或 批量 方式获取远程数据。
+     * 远程数据会经过 handleRemoteDataForDownload 钩子处理后再写入本地。
+     */
+    private suspend fun executeOverwriteMode(
+        startTime: Long,
+        syncOption: SyncOption
+    ): Result = withContext(Dispatchers.IO) {
+        val failureMessages = mutableListOf<String>()
+        val stats = SyncStats()
+        val epochStartTime = "1970-01-01 08:00:00"
+        val syncMode = syncConfig.syncMode
+
+        try {
+            // Step 1: 根据 syncMode 选择对应接口全量获取服务端数据
+            val remoteDataList: List<T> = if (syncMode == 1) {
+                fetchAllRemoteBatch(epochStartTime, failureMessages)
+            } else {
+                fetchAllRemoteById(epochStartTime, failureMessages)
+            }
+
+            if (remoteDataList == emptyList<T>() && failureMessages.isNotEmpty()) {
+                // 获取失败，failureMessages 中已有错误信息
+                return@withContext Result.failure(createFailData(failureMessages.joinToString("\n")))
+            }
+
+            if (remoteDataList.isEmpty()) {
+                libLogI("  服务端无数据，清空本地表")
+                repository.localDeleteAll()
+                libLogI("  ✅ 本地表已清空")
+                return@withContext Result.success(
+                    createSuccessData("服务端无数据，本地表已清空")
+                )
+            }
+
+            // Step 2: 处理远程数据（调用钩子，如人脸特征提取）
+            libLogI("⚙️ 步骤 2: 处理远程数据（调用 handleRemoteDataForDownload 钩子）")
+            val processedData = mutableListOf<T>()
+            for (data in remoteDataList) {
+                val processed = handleRemoteDataForDownload(data, failureMessages)
+                processed?.let {
+                    processedData.add(it)
+                    stats.recordDownload()
+                }
+            }
+            libLogI("  处理完成: 成功 ${processedData.size}/${remoteDataList.size}")
+
+            // Step 3: 全量写入处理后的数据（先写后删，保证事务安全）
+            // 如果写入失败，本地数据不会丢失
+            libLogI("💾 步骤 3: 全量写入本地 ${processedData.size} 条数据")
+            try {
+                repository.localBatchUpsert(processedData)
+                libLogI("  ✅ 本地数据写入完成")
+            } catch (e: Exception) {
+                libLogE("  ❌ 本地数据写入失败: ${e.message}")
+                return@withContext Result.failure(
+                    createFailData("本地数据写入失败: ${e.message}")
+                )
+            }
+
+            // Step 4: 写入成功后，删除不在新数据集中的旧记录
+            libLogI("🗑️ 步骤 4: 清理本地旧数据")
+            try {
+                val newIds = processedData.map { it.id }
+                repository.localDeleteAllExcept(newIds.toSet())
+                libLogI("  ✅ 本地旧数据已清理")
+            } catch (e: Exception) {
+                // 旧数据清理失败不影响整体结果，仅记录警告
+                libLogW("  ⚠️ 清理旧数据失败（不影响已写入数据）: ${e.message}")
+            }
+
+            finalizeSyncResult(startTime, stats, failureMessages)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleSyncException(e, startTime, failureMessages)
+        }
+    }
+
+    /**
+     * 批量方式全量获取远程数据（syncMode == 1 时使用）。
+     * 调用 remoteGetAfterUpdateTimeBatch 获取完整实体列表。
+     */
+    private suspend fun fetchAllRemoteBatch(
+        epochStartTime: String,
+        failureMessages: MutableList<String>
+    ): List<T> {
+        libLogI("📥 步骤 1: 全量获取服务端数据（覆盖模式 - 批量接口）")
+        val fetchStartTime = System.currentTimeMillis()
+        val remoteResult = repository.remoteGetAfterUpdateTimeBatch(epochStartTime)
+        val fetchDuration = System.currentTimeMillis() - fetchStartTime
+
+        if (remoteResult.isError()) {
+            libLogE("  ❌ 全量获取服务端数据失败: ${remoteResult.message}")
+            failureMessages.add("全量获取服务端数据失败: ${remoteResult.message}")
+            return emptyList()
+        }
+
+        val data = remoteResult.data ?: emptyList()
+        libLogI("  ✅ 服务端数据获取成功，数量: ${data.size}，耗时: ${fetchDuration}ms")
+        return data
+    }
+
+    /**
+     * ID单查方式全量获取远程数据（syncMode == 0 时使用）。
+     * 先获取全量 ID 列表，再逐条获取详情（受并发控制）。
+     */
+    @Suppress("DEPRECATION")
+    private suspend fun fetchAllRemoteById(
+        epochStartTime: String,
+        failureMessages: MutableList<String>
+    ): List<T> {
+        libLogI("📥 步骤 1: 全量获取服务端数据（覆盖模式 - ID单查接口）")
+
+        // 获取全量 ID 列表
+        libLogI("  ⬇️ 正在获取服务端全量 ID 列表...")
+        val idFetchStart = System.currentTimeMillis()
+        val remoteIdsResult = repository.remoteGetAfterUpdateTime(epochStartTime)
+        val idFetchDuration = System.currentTimeMillis() - idFetchStart
+
+        if (remoteIdsResult.isError()) {
+            libLogE("  ❌ 获取服务端 ID 列表失败: ${remoteIdsResult.message}")
+            failureMessages.add("获取服务端 ID 列表失败: ${remoteIdsResult.message}")
+            return emptyList()
+        }
+
+        val remoteIds = remoteIdsResult.data ?: emptyList()
+        libLogI("  ✅ 服务端 ID 列表获取成功，数量: ${remoteIds.size}，耗时: ${idFetchDuration}ms")
+
+        if (remoteIds.isEmpty()) return emptyList()
+
+        // 逐条获取详情
+        libLogI("  📦 分批获取项目详情...")
+        val batchSize = syncConfig.batchSize
+        val maxConcurrency = minOf(batchSize.coerceAtLeast(1), MAX_ID_QUERY_CONCURRENCY)
+        val semaphore = Semaphore(maxConcurrency)
+        libLogD("  并发控制: 最大并发数 $maxConcurrency")
+
+        val detailFetchStart = System.currentTimeMillis()
+        val allData = coroutineScope {
+            remoteIds.chunked(batchSize).flatMap { batchIds ->
+                batchIds.map { itemId ->
+                    async {
+                        semaphore.withPermit {
+                            try {
+                                val result = repository.remoteGetById(itemId)
+                                if (result.isError()) {
+                                    failureMessages.add("获取远程数据失败 (ID: $itemId): ${result.message}")
+                                    null
+                                } else {
+                                    result.data
+                                }
+                            } catch (e: Exception) {
+                                failureMessages.add("获取数据异常 (ID: $itemId): ${e.message}")
+                                null
+                            }
+                        }
+                    }
+                }.awaitAll()
+            }.filterNotNull()
+        }
+
+        val detailFetchDuration = System.currentTimeMillis() - detailFetchStart
+        libLogI("  ✅ 详情获取完成，成功: ${allData.size}/${remoteIds.size}，耗时: ${detailFetchDuration}ms")
+        return allData
     }
 
     /**
