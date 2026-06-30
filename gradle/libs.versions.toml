@@ -1,11 +1,14 @@
 [versions]
-agp = "9.1.1"
+agp = "9.2.1"
+# 显式声明 Kotlin 版本以覆盖 AGP 9.x 内置的 Kotlin 编译器(2.2.x),
+# 否则与传递依赖引入的 kotlin-stdlib 2.4.0 元数据版本不匹配会导致编译失败。
+kotlin = "2.4.0"
 work = "2.11.2"
 idgenerator = "1.0.6"
 network = "2026.05.11.01"
 junit = "4.13.2"
-coroutines-test = "1.10.2"
-mockk = "1.14.9"
+coroutines-test = "1.11.0"
+mockk = "1.14.11"
 robolectric = "4.16.1"
 
 [libraries]
@@ -21,3 +24,7 @@ robolectric = {module = "org.robolectric:robolectric",version.ref = "robolectric
 [plugins]
 android-library = { id = "com.android.library", version.ref = "agp" }
 android-application = { id = "com.android.application", version.ref = "agp" }
+# 通过基于 KGP 的 serialization 插件把 Kotlin 工具链固定为 2.4.0,
+# 覆盖 AGP 9.x 内置的 Kotlin 编译器(2.2.x)。
+# 注意: AGP 9.0 已禁用 org.jetbrains.kotlin.android 插件,不能直接 apply 它。
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
