@@ -55,7 +55,7 @@ publishing {
         create<MavenPublication>("release") {
             groupId = "com.github.Caleb-Rainbow"
             artifactId = "sync"
-            version = "2026.05.11.01"
+            version = "2026.07.10.01"
 
             afterEvaluate {
                 from(components["release"])
