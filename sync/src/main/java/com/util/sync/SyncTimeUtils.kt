@@ -38,11 +38,17 @@ object SyncTimeUtils {
 
     /**
      * 将 updateTime 字符串解析为 epoch 毫秒数，用于可靠的数值比较。
-     * 兼容两种格式：带毫秒和不带毫秒。
-     * 优先按系统时区解析；若失败，回退到 UTC（兼容旧数据）。
-     * 解析失败返回 null。
+     *
+     * 统一按设备本地时区 [ZoneId.systemDefault] 解析，兼容两种格式：带毫秒和不带毫秒。
+     *
+     * 时区约定：客户端与服务器必须使用同一时区（参见后端接口对接文档）。
+     * 客户端生成时间串时也使用本地时区，因此这里按本地时区解析可保证
+     * 「本地串」与「服务器串」在同一基准下比较。
+     *
+     * @return 解析得到的 epoch 毫秒；格式不合法时返回 null
      */
     fun parseUpdateTime(time: String): Long? {
+        // 先尝试带毫秒格式，再尝试不带毫秒格式，均按设备本地时区解析
         return try {
             java.time.LocalDateTime.parse(time, PARSE_FORMATTER_WITH_MS)
                 .atZone(ZoneId.systemDefault())
@@ -55,19 +61,7 @@ object SyncTimeUtils {
                     .toInstant()
                     .toEpochMilli()
             } catch (_: Exception) {
-                try {
-                    java.time.LocalDateTime.parse(time, PARSE_FORMATTER_WITH_MS)
-                        .toInstant(UTC_ZONE)
-                        .toEpochMilli()
-                } catch (_: Exception) {
-                    try {
-                        java.time.LocalDateTime.parse(time, STANDARD_FORMATTER)
-                            .toInstant(UTC_ZONE)
-                            .toEpochMilli()
-                    } catch (_: Exception) {
-                        null
-                    }
-                }
+                null
             }
         }
     }

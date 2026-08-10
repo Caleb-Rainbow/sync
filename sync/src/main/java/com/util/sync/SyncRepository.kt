@@ -28,8 +28,8 @@ interface SyncRepository<T : SyncableEntity> {
     @Deprecated("将在后续移除")
     suspend fun localGetById(id: Long): T?
 
-    // 远程批量更新或插入
-    suspend fun remoteBatchUpsert(data: List<T>): ResultModel<String> // 使用 Unit 表示只关心成功或失败
+    // 远程批量更新或插入（返回 ResultModel<String>，调用方只关心成功/失败，data 通常为 "ok"）
+    suspend fun remoteBatchUpsert(data: List<T>): ResultModel<String>
     // 本地批量更新或插入
     suspend fun localBatchUpsert(data: List<T>)
 
