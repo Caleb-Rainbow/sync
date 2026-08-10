@@ -33,7 +33,7 @@ Test results are in `sync/build/test-results/`.
 
 - **`:sync`** — The core library. All source code lives here under `com.util.sync`.
 - **`:app`** — Minimal shell app for development testing. Not published.
-- **Composite build** — `settings.gradle.kts` includes `F:\CodeProject\AndroidComposeProject\NetworkMoudle` as a composite build, substituting `com.github.Caleb-Rainbow:Ktor-Network` with the local `:ktor` project.
+- **Composite build** — `settings.gradle.kts` 的 `NetworkMoudle` `includeBuild` 当前已注释掉，库通过 JitPack 解析 `com.github.Caleb-Rainbow:Ktor-Network`（不替换为本地 `:ktor`）。如需本地联调网络库，取消注释 `settings.gradle.kts` 中的 `includeBuild("...\\NetworkMoudle")` 块即可。
 
 ### Core Classes (all in `sync/src/main/java/com/util/sync/`)
 

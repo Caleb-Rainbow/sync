@@ -102,7 +102,7 @@ SyncMoudle 是一个功能强大且灵活的 Android 数据同步库，旨在简
 
 - **minSdk**: 26 (Android 8.0)
 - **compileSdk**: 36
-- **JVM Target**: 17
+- **JVM Target**: 21
 
 ---
 
@@ -173,7 +173,8 @@ class SyncWorkManager(val context: Context) {
 - `workChineseName`: 工作中文名称
 - `syncOptionName`: 同步选项名称
 - `repository`: 数据仓库
-- `syncOptionInt`: 同步选项整数值
+- `syncOptionInt`: 同步选项整数值（0-DEVICE_UPLOAD / 1-SERVER_DOWNLOAD / 2-TWO_WAY_SYNC / 3-SYNC_OFF）
+- `serverDownloadModeInt`: 服务器下发模式（仅当 `syncOptionInt == 1` 时生效；0-增量同步，1-覆盖本地）
 - `syncConfig`: 同步配置
 
 **内部统计数据类 SyncStats**：
@@ -208,6 +209,10 @@ interface SyncRepository<T : SyncableEntity> {
     // 批量更新
     suspend fun remoteBatchUpsert(data: List<T>): ResultModel<String>
     suspend fun localBatchUpsert(data: List<T>)
+
+    // 覆盖本地模式 (serverDownloadModeInt == 1 时使用)
+    suspend fun localDeleteAll()
+    suspend fun localDeleteAllExcept(retainedIds: Set<Long>)
 }
 ```
 
@@ -239,7 +244,10 @@ interface SyncConfigProvider {
     var heartbeatPeriod: Int
     var deviceNumber: String
     var batchSize: Int
-    fun saveSuccessfulSyncTime(time: String)
+    var uploadBatchSize: Int
+    var syncMode: Int
+    var lastSyncAttemptTime: String
+    fun saveSuccessfulSyncTime(time: String)   // 实现必须线程安全
     fun getAllTask(): List<SyncTaskDefinition>
 }
 ```
@@ -410,7 +418,7 @@ TWO_WAY_SYNC("双向同步")
    - **两边都有数据**：比较 `updateTime` 时间戳
      - 服务器时间较新：下载到本地
      - 本地时间较新：上传到服务器
-     - 时间相同：跳过
+     - 时间差 ≤ 3 秒（时钟偏差容忍阈值）：视为同时更新，跳过
 5. 批量更新本地数据库和服务器
 6. 如配置了 `isDeleteLocalFile`，删除已成功上传的本地文件
 
@@ -430,6 +438,32 @@ SYNC_OFF("关闭同步")
 
 **工作流程**：
 - 直接返回成功，不执行任何同步操作
+
+### 5. 覆盖本地模式（SERVER_DOWNLOAD + serverDownloadModeInt = 1）
+
+**描述**：在「服务器单向下发」模式下，通过 `serverDownloadModeInt = 1` 启用「覆盖本地」策略——用服务端全量数据**替换**本地表，而非增量合并。适用于本设备只读、服务端为唯一数据源的场景。
+
+**适用场景**：
+- 基础数据由后台统一维护，设备端只读
+- 需要保证本地与服务端完全一致（删除也能同步）
+- 修复本地脏数据
+
+**实现细节**：
+```kotlin
+class ConfigSyncWorker(...) : BaseCompareWork<Config, ConfigRepository>(...) {
+    override val syncOptionInt: Int = 1            // SERVER_DOWNLOAD
+    override val serverDownloadModeInt: Int = 1    // 覆盖本地（0=增量）
+    // ...
+}
+```
+
+**工作流程**（`BaseCompareWork.executeOverwriteMode`）：
+1. 以 epoch 起始时间全量获取服务端数据（根据 `syncMode` 选择批量或 ID 单查接口）
+2. 逐条调用 `handleRemoteDataForDownload` 钩子处理（如人脸特征提取）
+3. **先写后删**：`localBatchUpsert(processedData)` 写入处理后的全量数据（写入失败则保留原数据，不会丢失）
+4. `localDeleteAllExcept(newIds)` 清理不在新数据集中的旧记录（清理失败仅警告，不影响已写入数据）
+
+> ⚠️ 与增量 SERVER_DOWNLOAD 的区别：增量模式（`serverDownloadModeInt=0`）只把服务端更新的记录合并进本地，不删除本地已有的记录；覆盖模式会用服务端数据集完全替换本地表。
 
 ### 同步模式切换
 
@@ -451,7 +485,7 @@ val description = syncOption.description // "设备单向上传"
 
 ```kotlin
 dependencies {
-    implementation("com.github.Caleb-Rainbow:sync:2026.02.03.01")
+    implementation("com.github.Caleb-Rainbow:sync:2026.07.10.01")
 }
 ```
 
@@ -468,9 +502,12 @@ class MySyncConfigProvider : SyncConfigProvider {
     override var heartbeatPeriod: Int = 60
     override var deviceNumber: String = ""
     override var batchSize: Int = 50
+    override var uploadBatchSize: Int = 200
+    override var syncMode: Int = 1   // 0-ID单查，1-批量（推荐）
+    override var lastSyncAttemptTime: String = ""
 
     override fun saveSuccessfulSyncTime(time: String) {
-        // 保存同步时间到本地存储
+        // 保存同步时间到本地存储（实现必须线程安全，推荐继承 AbstractSyncConfigProvider）
         syncDataTime = time
     }
 
@@ -543,6 +580,7 @@ class UserDataSyncWorker(
     override val syncOptionName: String = "用户数据"
     override val repository: UserDataRepository = this.repository
     override val syncOptionInt: Int = 2 // TWO_WAY_SYNC
+    override val serverDownloadModeInt: Int = 0 // 增量同步（1=覆盖本地）
     override val syncConfig: SyncConfigProvider = this.syncConfig
 
     override suspend fun handleLocalDataForUpload(
@@ -659,7 +697,8 @@ flow.collect { workInfos ->
 | `workChineseName` | String | 工作名称（中文） |
 | `syncOptionName` | String | 同步选项名称 |
 | `repository` | R | 数据仓库实例 |
-| `syncOptionInt` | Int | 同步选项整数值 |
+| `syncOptionInt` | Int | 同步选项整数值（0/1/2/3） |
+| `serverDownloadModeInt` | Int | 服务器下发模式（仅 `syncOptionInt==1` 生效；0-增量同步，1-覆盖本地） |
 | `syncConfig` | SyncConfigProvider | 同步配置 |
 
 #### 钩子方法
@@ -841,7 +880,9 @@ suspend fun localBatchUpsert(data: List<T>)
 | `heartbeatPeriod` | Int | 心跳周期（秒） |
 | `deviceNumber` | String | 设备编号 |
 | `batchSize` | Int | 批量大小 |
+| `uploadBatchSize` | Int | 上传到服务器时每批最大数量（默认 200） |
 | `syncMode` | Int | 同步模式（0-ID单查，1-批量） |
+| `lastSyncAttemptTime` | String | 最近一次同步尝试时间（无论成功或失败） |
 
 #### 方法
 
@@ -954,8 +995,14 @@ class MySyncConfigProvider : SyncConfigProvider {
     // 批量大小，用于分批获取数据
     override var batchSize: Int = 50
 
+    // 上传到服务器时每批最大数量
+    override var uploadBatchSize: Int = 200
+
     // 同步模式：0-ID单查，1-批量（推荐）
     override var syncMode: Int = 1
+
+    // 最近一次同步尝试时间（无论成功或失败）
+    override var lastSyncAttemptTime: String = ""
 
     override fun saveSuccessfulSyncTime(time: String) {
         syncDataTime = time
@@ -1108,6 +1155,7 @@ class UserSyncWorker(
     override val syncOptionName: String = "用户数据"
     override val repository: UserRepository = this.repository
     override val syncOptionInt: Int = 2 // TWO_WAY_SYNC
+    override val serverDownloadModeInt: Int = 0 // 增量同步（1=覆盖本地）
     override val syncConfig: SyncConfigProvider = this.syncConfig
 
     override suspend fun handleLocalDataForUpload(
@@ -1503,12 +1551,13 @@ override var batchSize: Int = 100 // 设置合适的批量大小
 
 ## 版本信息
 
-### 当前版本：2026.02.03.01
+### 当前版本：2026.07.10.01
 
 ### 版本历史
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| 2026.07.10.01 | 2026-07-10 | 新增「覆盖本地」模式（serverDownloadModeInt）；SyncRepository 新增 localDeleteAll/localDeleteAllExcept；SyncConfigProvider 新增 uploadBatchSize/syncMode/lastSyncAttemptTime；saveSuccessfulSyncTime 线程安全（CAS 单调递增） |
 | 2026.02.03.01 | 2026-02-03 | 新增 SyncStats 统计数据类；优化日志性能（TAG 缓存、惰性求值）；改进异常处理和日志输出 |
 | 1.0.8 | 2025-01-26 | 重构日志系统，采用依赖注入方式；新增批量同步模式；优化同步性能 |
 | 1.0.7 | 2025-01-21 | 初始版本发布 |
@@ -1530,7 +1579,7 @@ override var batchSize: Int = 100 // 设置合适的批量大小
 
 - **minSdk**: 26 (Android 8.0)
 - **compileSdk**: 36
-- **JVM Target**: 17
+- **JVM Target**: 21
 
 ---
 
@@ -1614,4 +1663,4 @@ override var batchSize: Int = 100 // 设置合适的批量大小
 
 ---
 
-**最后更新时间：2026-02-03**
+**最后更新时间：2026-08-10**
