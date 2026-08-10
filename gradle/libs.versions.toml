@@ -10,10 +10,12 @@ junit = "4.13.2"
 coroutines-test = "1.11.0"
 mockk = "1.14.11"
 robolectric = "4.16.1"
+androidx-test-core = "1.6.1"
 
 [libraries]
 androidx-work = {module = "androidx.work:work-runtime-ktx",version.ref = "work"}
 androidx-work-testing = {module = "androidx.work:work-testing",version.ref = "work"}
+androidx-test-core = {module = "androidx.test:core",version.ref = "androidx-test-core"}
 idgenerator = {module = "com.github.yitter:yitter-idgenerator",version.ref = "idgenerator"}
 network = {module = "com.github.Caleb-Rainbow:Ktor-Network",version.ref = "network"}
 junit = {module = "junit:junit",version.ref = "junit"}
