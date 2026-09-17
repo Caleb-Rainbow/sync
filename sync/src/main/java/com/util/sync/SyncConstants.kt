@@ -15,14 +15,15 @@ const val KEY_SYNC_START_TIME = "KEY_SYNC_START_TIME"
 /** WorkManager Data 键：同步会话 ID */
 const val KEY_SYNC_SESSION_ID = "KEY_SYNC_SESSION_ID"
 
+/** 子任务本轮未执行，协调器不得据此推进全局游标。 */
+const val KEY_SYNC_SKIPPED = "KEY_SYNC_SKIPPED"
+internal const val KEY_SYNC_OPTIONS = "KEY_SYNC_OPTIONS"
+internal const val KEY_SYNC_USERNAME = "KEY_SYNC_USERNAME"
+internal const val KEY_SYNC_DEVICE = "KEY_SYNC_DEVICE"
+
 /**
- * 全局同步工作标签（tag），用于跨手动/自动同步的互斥与状态查询。
- *
- * 使用方式（注意各路径策略不同）：
- * - 手动同步：每个 Compare Worker 以 [ExistingWorkPolicy.REPLACE] 入队，并打上此标签；
- *   不同 Worker 类型各自用独立 unique work name，避免互相清理 WorkSpec。
- * - 自动同步：`SyncCoordinatorWorker` 入队子任务时打上此标签，启动时检查是否存在
- *   RUNNING 状态的同标签任务，有则 `Result.retry()` 退让。
- * - 查询/取消：`SyncWorkManager.isSyncRunning()` 与 `cancelAllSync()` 均基于此标签。
+ * 全局同步工作标签，用于状态查询和取消。
+ * 手动任务使用每类型唯一名称 + KEEP；BaseCompareWork 在同进程中串行执行。
+ * 自动协调器、子任务和成功提交均加此标签；旧入口还可通过 Worker 类名 tag 取消。
  */
 const val GLOBAL_SYNC_WORK_NAME = "global_sync_work"

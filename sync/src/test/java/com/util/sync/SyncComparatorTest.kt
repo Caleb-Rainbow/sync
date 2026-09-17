@@ -158,27 +158,27 @@ class SyncComparatorTest {
     // ═══════════════════════════════════════════════════════════
 
     @Test
-    fun `TWO_WAY_SYNC within threshold 1ms - skip`() {
+    fun `TWO_WAY_SYNC within threshold 1ms - download`() {
         val local = TestEntity(id = 1, updateTime = "2026-01-15 10:30:45.000")
         val remote = TestEntity(id = 1, updateTime = "2026-01-15 10:30:45.001")
         val result = comparator.compare(local, remote, SyncOption.TWO_WAY_SYNC)
-        assertEquals(SyncDecision.Skip, result)
+        assertEquals(SyncDecision.ShouldDownload, result)
     }
 
     @Test
-    fun `TWO_WAY_SYNC within threshold 2999ms - skip`() {
+    fun `TWO_WAY_SYNC within threshold 2999ms - download`() {
         val local = TestEntity(id = 1, updateTime = "2026-01-15 10:30:45.000")
         val remote = TestEntity(id = 1, updateTime = "2026-01-15 10:30:47.999")
         val result = comparator.compare(local, remote, SyncOption.TWO_WAY_SYNC)
-        assertEquals(SyncDecision.Skip, result)
+        assertEquals(SyncDecision.ShouldDownload, result)
     }
 
     @Test
-    fun `TWO_WAY_SYNC exactly at threshold 3000ms - skip`() {
+    fun `TWO_WAY_SYNC exactly at threshold 3000ms - download`() {
         val local = TestEntity(id = 1, updateTime = "2026-01-15 10:30:45.000")
         val remote = TestEntity(id = 1, updateTime = "2026-01-15 10:30:48.000")
         val result = comparator.compare(local, remote, SyncOption.TWO_WAY_SYNC)
-        assertEquals(SyncDecision.Skip, result)
+        assertEquals(SyncDecision.ShouldDownload, result)
     }
 
     @Test
@@ -202,7 +202,7 @@ class SyncComparatorTest {
         val local = TestEntity(id = 1, updateTime = "2099-12-31 23:59:58.000")
         val remote = TestEntity(id = 1, updateTime = "2099-12-31 23:59:59.999")
         val result = comparator.compare(local, remote, SyncOption.TWO_WAY_SYNC)
-        assertEquals(SyncDecision.Skip, result)
+        assertEquals(SyncDecision.ShouldDownload, result)
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -373,7 +373,7 @@ class SyncComparatorTest {
     // ═══════════════════════════════════════════════════════════
 
     @Test
-    fun `compareBatch all items within skew threshold - all skipped`() {
+    fun `compareBatch small timestamp differences are all downloaded`() {
         val localMap = (1L..100L).associateWith { id ->
             TestEntity(id = id, updateTime = "2026-01-15 10:30:45.000")
         }
@@ -382,9 +382,9 @@ class SyncComparatorTest {
         }
 
         val result = comparator.compareBatch(localMap, remoteMap, SyncOption.TWO_WAY_SYNC)
-        assertEquals(100, result.skipped)
+        assertEquals(0, result.skipped)
         assertEquals(0, result.toUpload.size)
-        assertEquals(0, result.toDownload.size)
+        assertEquals(100, result.toDownload.size)
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -475,13 +475,13 @@ class SyncComparatorTest {
     }
 
     @Test
-    fun `custom threshold very large - everything is skip`() {
+    fun `custom threshold very large - does not suppress changes`() {
         val customComparator = SyncComparator<TestEntity>(timeSkewThresholdMs = Long.MAX_VALUE)
         val local = TestEntity(id = 1, updateTime = "2026-01-15 10:30:40.000")
         val remote = TestEntity(id = 1, updateTime = "2099-12-31 23:59:59.999")
 
         val result = customComparator.compare(local, remote, SyncOption.TWO_WAY_SYNC)
-        assertEquals(SyncDecision.Skip, result)
+        assertEquals(SyncDecision.ShouldDownload, result)
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -501,7 +501,7 @@ class SyncComparatorTest {
         val local = TestEntity(id = 1, updateTime = "2026-01-15 10:30:40")
         val remote = TestEntity(id = 1, updateTime = "2026-01-15 10:30:40.000")
         val result = comparator.compare(local, remote, SyncOption.TWO_WAY_SYNC)
-        assertEquals(SyncDecision.Skip, result)
+        assertEquals(SyncDecision.ShouldDownload, result)
     }
 
     // ═══════════════════════════════════════════════════════════

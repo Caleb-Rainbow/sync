@@ -4,7 +4,7 @@ package com.util.sync
  * 同步比较决策结果（无泛型的简单标记）
  */
 sealed class SyncDecision {
-    /** 跳过（时钟偏差范围内） */
+    /** 跳过（时间一致且没有删除冲突） */
     data object Skip : SyncDecision()
     /** 解析错误 */
     data class ParseError(
@@ -35,9 +35,10 @@ data class SyncCompareResult<T : SyncableEntity>(
  * 从 BaseCompareWork 中提取，便于独立测试。
  *
  * @param T 同步实体类型
+ * @param timeSkewThresholdMs 为调用兼容保留；实际同步不再用时间容差吞掉变更。
  */
 class SyncComparator<T : SyncableEntity>(
-    private val timeSkewThresholdMs: Long = SyncTimeUtils.TIME_SKEW_THRESHOLD_MS
+    @Suppress("UNUSED_PARAMETER") timeSkewThresholdMs: Long = SyncTimeUtils.TIME_SKEW_THRESHOLD_MS
 ) {
     /**
      * 对一对本地/远程数据进行比较，返回同步决策。
@@ -69,11 +70,15 @@ class SyncComparator<T : SyncableEntity>(
                     if (remoteTime == null || localTime == null) {
                         SyncDecision.ParseError(localData.id, remoteData.updateTime, localData.updateTime)
                     } else {
-                        val diff = kotlin.math.abs(remoteTime - localTime)
                         when {
-                            diff <= timeSkewThresholdMs -> SyncDecision.Skip
                             remoteTime > localTime -> SyncDecision.ShouldDownload
-                            else -> SyncDecision.ShouldUpload
+                            localTime > remoteTime -> SyncDecision.ShouldUpload
+                            // 秒精度相同时也不能吞掉删除；删除优先，避免复活记录。
+                            remoteData.isDelete != localData.isDelete ->
+                                if (remoteData.isDelete) SyncDecision.ShouldDownload else SyncDecision.ShouldUpload
+                            // 无版本协议下，同时间内容冲突采用服务端优先的确定性决策。
+                            remoteData != localData -> SyncDecision.ShouldDownload
+                            else -> SyncDecision.Skip
                         }
                     }
                 }

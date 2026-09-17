@@ -37,6 +37,8 @@ Test results are in `sync/build/test-results/`.
 
 ### Core Classes (all in `sync/src/main/java/com/util/sync/`)
 
+**Safety integration** — See `SYNC_SAFETY.md` for the unchanged timestamp protocol, paused-task cursor protection, shared execution gates, and the host Room transaction overrides required for atomic local writes.
+
 **Sync flow** — `SyncWorkManager` enqueues a `SyncCoordinatorWorker`, which runs all registered `SyncSubTask`s sequentially. Each task uses a subclass of `BaseCompareWork` to perform the actual sync. On full success, `SyncSuccessUpdaterWorker` persists the sync timestamp.
 
 | Class | Role |
@@ -45,10 +47,10 @@ Test results are in `sync/build/test-results/`.
 | `SyncCoordinatorWorker` | Orchestrator. Runs tasks sequentially, retries failed ones (up to 3x with exponential backoff), triggers timestamp update only on full success. |
 | `SyncComparator` | Pure comparison engine. Compares entity pairs by timestamp and returns `SyncDecision`. |
 | `SyncRepository<T>` | Interface consuming apps implement to bridge local DB (Room) and remote API. |
-| `SyncConfigProvider` | Config interface + thread-safe `AbstractSyncConfigProvider` using atomic types with CAS-based monotonic timestamp updates. |
+| `SyncConfigProvider` | Config interface + thread-safe `AbstractSyncConfigProvider` using atomic fields and serialized persistence-before-publication for timestamp updates. |
 | `SyncWorkManager` | Facade for scheduling WorkManager `OneTimeWorkRequest`s with exponential backoff. |
 | `HeartWork` | Periodic heartbeat worker using `HeartRepository` from the network module. |
-| `SyncTimeUtils` | Pure utility for time parsing (`yyyy-MM-dd HH:mm:ss[.SSS]`, UTC-first) and comparison with configurable clock skew. |
+| `SyncTimeUtils` | Pure utility for time parsing (`yyyy-MM-dd HH:mm:ss[.SSS]`, device local timezone); clock-skew diagnostics are separate from sync decisions. |
 
 ### Key Patterns
 

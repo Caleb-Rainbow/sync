@@ -18,6 +18,17 @@ import com.util.sync.KEY_SYNC_START_TIME
 import com.util.sync.SyncConfigProvider
 import com.util.sync.SyncTaskDefinition
 import com.util.sync.SyncTimeUtils
+import com.util.sync.SyncCursorGuard
+import com.util.sync.SyncExecutionGate
+import com.util.sync.KEY_SYNC_SKIPPED
+import com.util.sync.KEY_SYNC_OPTIONS
+import com.util.sync.KEY_SYNC_USERNAME
+import com.util.sync.KEY_SYNC_DEVICE
+import com.util.sync.createFailData
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import androidx.work.await
 import com.util.sync.log.libLogD
 import com.util.sync.log.libLogE
 import com.util.sync.log.libLogI
@@ -65,7 +76,9 @@ class SyncCoordinatorWorker(
     private fun parseLastSyncTime(time: String): Long =
         SyncTimeUtils.parseUpdateTime(time) ?: 0L
 
-    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+    override suspend fun doWork(): Result = SyncExecutionGate.withCoordinatorLock { runSync() }
+
+    private suspend fun runSync(): Result = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
         val workerId = id.toString().takeLast(8)
 
@@ -75,15 +88,10 @@ class SyncCoordinatorWorker(
         libLogI("  开始时间: ${formatTimestamp(startTime)}")
         libLogI("════════════════════════════════════════")
 
-        // 检查是否有同步任务正在运行（手动同步或其它自动同步），避免并发冲突
+        // 编排互斥与数据互斥分开，避免持有数据锁等待子 Worker 的死锁。
         val workManager = WorkManager.getInstance(context)
-        val runningSyncs = workManager.getWorkInfosByTagFlow(GLOBAL_SYNC_WORK_NAME).first()
-            .filter { it.state == WorkInfo.State.RUNNING }
-        if (runningSyncs.isNotEmpty()) {
-            libLogW("⚠️ 检测到已有同步任务正在运行，自动同步退让")
-            libLogW("  运行中的任务数: ${runningSyncs.size}")
-            return@withContext Result.retry()
-        }
+        val initialUsername = syncConfigProvider.username
+        val initialDevice = syncConfigProvider.deviceNumber
 
         // 检查用户登录状态
         if (syncConfigProvider.username.isEmpty()) {
@@ -128,6 +136,7 @@ class SyncCoordinatorWorker(
 
         // 获取所有需要执行的同步任务
         val allTasks = syncConfigProvider.getAllTask()
+        val cursorGuard = SyncCursorGuard(allTasks)
         libLogI("📋 任务列表: 共 ${allTasks.size} 个任务")
 
         allTasks.forEachIndexed { index, task ->
@@ -185,15 +194,12 @@ class SyncCoordinatorWorker(
                 try {
                     // 创建并入队单个任务
                     val workRequest = createOneTimeWork(task.workerClass, lastSyncTime, sessionId)
-                    workManager.enqueue(workRequest)
-
-                    // 使用 Flow 等待任务完成（阻塞直到任务进入终态）
-                    val workInfo = workManager.getWorkInfoByIdFlow(workRequest.id)
-                        .first { it != null && it.state.isFinished }
+                    val workInfo = runRequest(workManager, workRequest)
                     val taskDuration = System.currentTimeMillis() - taskStartTime
 
-                    when (workInfo?.state) {
+                    when (workInfo.state) {
                         WorkInfo.State.SUCCEEDED -> {
+                            if (workInfo.outputData.getBoolean(KEY_SYNC_SKIPPED, false)) cursorGuard.skipped = true
                             libLogI("    ✅ 任务成功: $taskName, 耗时: ${taskDuration}ms")
                             attemptResults.add(TaskResult(taskName, workerClassName, task, true, taskDuration))
                         }
@@ -205,11 +211,11 @@ class SyncCoordinatorWorker(
                         }
                         WorkInfo.State.CANCELLED -> {
                             libLogW("    ⚠️ 任务被取消: $taskName, 耗时: ${taskDuration}ms")
-                            attemptResults.add(TaskResult(taskName, workerClassName, task, false, taskDuration, "任务被取消"))
+                            return@withContext Result.failure(createFailData("同步已取消，停止调度后续任务"))
                         }
                         else -> {
-                            libLogW("    ⚠️ 任务状态异常: $taskName, 状态: ${workInfo?.state}, 耗时: ${taskDuration}ms")
-                            attemptResults.add(TaskResult(taskName, workerClassName, task, false, taskDuration, "状态异常: ${workInfo?.state}"))
+                            libLogW("    ⚠️ 任务状态异常: $taskName, 状态: ${workInfo.state}, 耗时: ${taskDuration}ms")
+                            attemptResults.add(TaskResult(taskName, workerClassName, task, false, taskDuration, "状态异常: ${workInfo.state}"))
                         }
                     }
                 } catch (e: CancellationException) {
@@ -232,8 +238,8 @@ class SyncCoordinatorWorker(
             }
 
             if (attempt < MAX_RETRY_COUNT) {
-                val failedNames = failedResults.map { it.taskName }.toSet()
-                remainingTasks = remainingTasks.filter { it.title in failedNames }
+                val failedWorkers = failedResults.map { it.task.workerClass }.toSet()
+                remainingTasks = remainingTasks.filter { it.workerClass in failedWorkers }
                 libLogW("  ⚠️ ${failedResults.size} 个任务失败，将在重试时跳过已成功的任务")
             } else {
                 libLogW("  ❌ 已达到最大重试次数 ($MAX_RETRY_COUNT)，以下任务仍然失败:")
@@ -260,27 +266,39 @@ class SyncCoordinatorWorker(
         libLogI("────────────────────────────────────────")
 
         // 根据任务执行结果决定是否触发 SyncSuccessUpdaterWorker
-        if (allTasksSucceeded) {
+        val canAdvance = cursorGuard.canAdvance(syncConfigProvider.getAllTask()) &&
+            initialUsername == syncConfigProvider.username && initialDevice == syncConfigProvider.deviceNumber
+        if (allTasksSucceeded && canAdvance) {
             libLogI("🏆 所有任务执行成功，准备更新同步时间戳")
 
             try {
                 // 创建并执行成功更新器
                 val successUpdaterWork = OneTimeWorkRequestBuilder<SyncSuccessUpdaterWorker>()
-                    .setInputData(workDataOf(KEY_SYNC_START_TIME to syncStartTime))
+                    .addTag(GLOBAL_SYNC_WORK_NAME)
+                    .setInputData(workDataOf(
+                        KEY_SYNC_START_TIME to syncStartTime,
+                        KEY_SYNC_OPTIONS to cursorGuard.signature,
+                        KEY_SYNC_USERNAME to initialUsername,
+                        KEY_SYNC_DEVICE to initialDevice,
+                    ))
                     .build()
 
-                workManager.enqueue(successUpdaterWork)
-                val updaterInfo = workManager.getWorkInfoByIdFlow(successUpdaterWork.id)
-                    .first { it != null && it.state.isFinished }
+                val updaterInfo = runRequest(workManager, successUpdaterWork)
 
-                if (updaterInfo?.state == WorkInfo.State.SUCCEEDED) {
+                if (updaterInfo.state == WorkInfo.State.SUCCEEDED) {
                     libLogI("  ✅ SyncSuccessUpdaterWorker 执行成功")
                 } else {
-                    libLogW("  ⚠️ SyncSuccessUpdaterWorker 执行状态: ${updaterInfo?.state}")
+                    allTasksSucceeded = false
+                    libLogW("  ⚠️ SyncSuccessUpdaterWorker 执行状态: ${updaterInfo.state}")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
+                allTasksSucceeded = false
                 libLogE("  💥 SyncSuccessUpdaterWorker 执行异常", e)
             }
+        } else if (allTasksSucceeded) {
+            libLogI("⏸️ 有任务停用、跳过或配置变化，保留原同步时间供恢复后回补")
         } else {
             libLogW("⚠️ 存在失败的任务，跳过更新同步时间戳")
             libLogW("  失败任务将在下次同步时重试")
@@ -303,6 +321,23 @@ class SyncCoordinatorWorker(
         libLogI("════════════════════════════════════════")
 
         return@withContext if (allTasksSucceeded) Result.success() else Result.failure()
+    }
+
+    /** 父协程退出时取消尚未完成的请求，避免子任务脱离本轮继续写入。 */
+    private suspend fun runRequest(workManager: WorkManager, request: OneTimeWorkRequest): WorkInfo {
+        currentCoroutineContext().ensureActive()
+        var finished = false
+        try {
+            workManager.enqueue(request).await()
+            val info = requireNotNull(workManager.getWorkInfoByIdFlow(request.id)
+                .first { it != null && it.state.isFinished })
+            finished = true
+            return info
+        } finally {
+            if (!finished) withContext(NonCancellable) {
+                workManager.cancelWorkById(request.id).await()
+            }
+        }
     }
 
     /**
@@ -335,6 +370,7 @@ class SyncCoordinatorWorker(
      */
     fun createCoordinatorWork(): OneTimeWorkRequest =
         OneTimeWorkRequestBuilder<SyncCoordinatorWorker>()
+            .addTag(GLOBAL_SYNC_WORK_NAME)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
 }

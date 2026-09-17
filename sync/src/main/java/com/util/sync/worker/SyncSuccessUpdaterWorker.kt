@@ -5,6 +5,13 @@ import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.util.sync.KEY_SYNC_START_TIME
 import com.util.sync.SyncConfigProvider
+import com.util.sync.SyncCursorGuard
+import com.util.sync.KEY_SYNC_OPTIONS
+import com.util.sync.KEY_SYNC_USERNAME
+import com.util.sync.KEY_SYNC_DEVICE
+import com.util.sync.KEY_SYNC_SKIPPED
+import androidx.work.workDataOf
+import kotlinx.coroutines.CancellationException
 import com.util.sync.log.libLogD
 import com.util.sync.log.libLogE
 import com.util.sync.log.libLogI
@@ -58,6 +65,16 @@ class SyncSuccessUpdaterWorker(
         }
 
         try {
+            // 请求可能排队，提交前再复核配置，防止在等待期间关闭任务后仍前进游标。
+            val expectedOptions = inputData.getStringArray(KEY_SYNC_OPTIONS)
+            if (expectedOptions != null && (
+                !expectedOptions.contentEquals(SyncCursorGuard.signatureOf(configProvider.getAllTask())) ||
+                inputData.getString(KEY_SYNC_USERNAME) != configProvider.username ||
+                inputData.getString(KEY_SYNC_DEVICE) != configProvider.deviceNumber
+            )) {
+                libLogI("同步配置已变化，保留原同步时间")
+                return@withContext Result.success(workDataOf(KEY_SYNC_SKIPPED to true))
+            }
             // 获取更新前的时间戳（用于日志对比）
             val previousSyncTime = configProvider.syncDataTime
 
@@ -78,6 +95,8 @@ class SyncSuccessUpdaterWorker(
             libLogI("════════════════════════════════════════")
 
             Result.success()
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             val endTime = System.currentTimeMillis()
             val duration = endTime - startTime

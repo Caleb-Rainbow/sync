@@ -12,6 +12,7 @@ import com.util.sync.log.libLogE
 import com.util.sync.log.libLogI
 import com.util.sync.log.libLogW
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import java.util.Locale
 
@@ -108,6 +109,8 @@ class HeartWork(
                     createFailData("心跳失败,错误码->${result.code} ${result.message}")
                 )
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             val endTime = System.currentTimeMillis()
             val duration = endTime - startTime

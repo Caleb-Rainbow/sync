@@ -22,6 +22,10 @@ extensions.configure<LibraryExtension>("android") {
         unitTests {
             isIncludeAndroidResources = true
             isReturnDefaultValues = true
+            all {
+                // Robolectric 在 JDK 25 上拦截 FileDescriptor 时需要访问此包。
+                it.jvmArgs("--add-exports=java.base/jdk.internal.access=ALL-UNNAMED")
+            }
         }
     }
 

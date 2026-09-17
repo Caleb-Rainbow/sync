@@ -262,7 +262,7 @@ class BaseCompareWorkTest {
     }
 
     @Test
-    fun `TWO_WAY within 3s skew skips both upload and download`() {
+    fun `TWO_WAY within 3s skew downloads newer remote data`() {
         val local = TestEntity(id = 1L, updateTime = "2026-01-15 10:30:45.000")
         val remote = TestEntity(id = 1L, updateTime = "2026-01-15 10:30:47.000") // 差 2s
         val repo = FakeSyncRepository().apply {
@@ -274,8 +274,8 @@ class BaseCompareWorkTest {
         val result = runWork(repo, config, optionInt = 2)
 
         assertTrue(result is androidx.work.ListenableWorker.Result.Success)
-        assertTrue("3s 内应跳过，不下载", repo.localUpsertCalls.isEmpty())
-        assertTrue("3s 内应跳过，不上传", repo.remoteUpsertCalls.isEmpty())
+        assertEquals(listOf(remote), repo.localUpsertCalls.single())
+        assertTrue("远端较新，不上传", repo.remoteUpsertCalls.isEmpty())
     }
 
     // ═══════════════════════════════════════════════════════════

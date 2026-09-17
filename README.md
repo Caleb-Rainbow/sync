@@ -2,6 +2,8 @@
 
 > 一个基于 WorkManager 的 Android 数据同步库，用于设备与服务器间的双向数据同步
 
+同步完整性修复、停用回补策略及 Room 事务接入见 [同步安全说明](SYNC_SAFETY.md)。
+
 ## 目录
 
 - [项目概述](#项目概述)
@@ -418,7 +420,8 @@ TWO_WAY_SYNC("双向同步")
    - **两边都有数据**：比较 `updateTime` 时间戳
      - 服务器时间较新：下载到本地
      - 本地时间较新：上传到服务器
-     - 时间差 ≤ 3 秒（时钟偏差容忍阈值）：视为同时更新，跳过
+     - 时间不相同：即使相差不足 3 秒，也同步较新的一侧
+     - 时间相同：删除冲突时删除优先；其他内容冲突时服务端优先；实体值相同才跳过
 5. 批量更新本地数据库和服务器
 6. 如配置了 `isDeleteLocalFile`，删除已成功上传的本地文件
 
@@ -460,8 +463,8 @@ class ConfigSyncWorker(...) : BaseCompareWork<Config, ConfigRepository>(...) {
 **工作流程**（`BaseCompareWork.executeOverwriteMode`）：
 1. 以 epoch 起始时间全量获取服务端数据（根据 `syncMode` 选择批量或 ID 单查接口）
 2. 逐条调用 `handleRemoteDataForDownload` 钩子处理（如人脸特征提取）
-3. **先写后删**：`localBatchUpsert(processedData)` 写入处理后的全量数据（写入失败则保留原数据，不会丢失）
-4. `localDeleteAllExcept(newIds)` 清理不在新数据集中的旧记录（清理失败仅警告，不影响已写入数据）
+3. 任意获取或预处理失败则终止，禁止按不完整结果删除本地数据；缺失 `data` 不视为空表
+4. 调用 `localReplaceAll(processedData)` 替换快照。默认先写后删，清理失败返回失败；宿主可覆盖为 Room 事务
 
 > ⚠️ 与增量 SERVER_DOWNLOAD 的区别：增量模式（`serverDownloadModeInt=0`）只把服务端更新的记录合并进本地，不删除本地已有的记录；覆盖模式会用服务端数据集完全替换本地表。
 

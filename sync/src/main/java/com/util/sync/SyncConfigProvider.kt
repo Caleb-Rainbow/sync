@@ -46,6 +46,7 @@ interface SyncConfigProvider {
      */
     var lastSyncAttemptTime: String
 
+    /** 必须返回全部已注册任务（包括停用的任务），用于全局时间戳的安全推进判断。 */
     fun getAllTask(): List<SyncTaskDefinition>
 }
 
@@ -57,6 +58,7 @@ interface SyncConfigProvider {
 abstract class AbstractSyncConfigProvider : SyncConfigProvider {
     private val _username = AtomicReference("")
     private val _syncDataTime = AtomicReference("")
+    private val syncTimeLock = Any()
     private val _isDeleteLocalFile = AtomicBoolean(false)
     private val _isHeartbeat = AtomicBoolean(false)
     private val _heartbeatPeriod = AtomicInteger(0)
@@ -72,7 +74,7 @@ abstract class AbstractSyncConfigProvider : SyncConfigProvider {
 
     override var syncDataTime: String
         get() = _syncDataTime.get()
-        set(value) { _syncDataTime.set(value) }
+        set(value) { synchronized(syncTimeLock) { _syncDataTime.set(value) } }
 
     override var isDeleteLocalFile: Boolean
         get() = _isDeleteLocalFile.get()
@@ -107,27 +109,21 @@ abstract class AbstractSyncConfigProvider : SyncConfigProvider {
         set(value) { _lastSyncAttemptTime.set(value) }
 
     /**
-     * 使用 CAS 保证时间戳只向前更新，避免并发写入导致回退。
-     * 仅在值实际变更时调用持久化。
+     * 串行提交持久化和内存时间。持久化失败时不发布新值，允许同值重试。
      */
     final override fun saveSuccessfulSyncTime(time: String) {
-        var updated = false
-        _syncDataTime.updateAndGet { current ->
+        synchronized(syncTimeLock) {
+            val current = _syncDataTime.get()
             if (current.isEmpty() || time > current) {
-                updated = true
-                time
-            } else {
-                current
+                doSaveSuccessfulSyncTime(time)
+                _syncDataTime.set(time)
             }
-        }
-        if (updated) {
-            doSaveSuccessfulSyncTime(time)
         }
     }
 
     /**
      * 子类实现具体的持久化逻辑（如写入 SharedPreferences）。
-     * 已由 [saveSuccessfulSyncTime] 保证内存值的线程安全。
+     * 必须同步完成持久化；失败应抛出异常，不能启动异步写入后立即返回。
      */
     protected abstract fun doSaveSuccessfulSyncTime(time: String)
 }
