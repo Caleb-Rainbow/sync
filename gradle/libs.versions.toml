@@ -1,5 +1,5 @@
 [versions]
-agp = "9.2.1"
+agp = "9.3.2"
 # 显式声明 Kotlin 版本以覆盖 AGP 9.x 内置的 Kotlin 编译器(2.2.x),
 # 否则与传递依赖引入的 kotlin-stdlib 2.4.0 元数据版本不匹配会导致编译失败。
 kotlin = "2.4.0"
@@ -9,8 +9,8 @@ network = "2026.07.10.01"
 junit = "4.13.2"
 coroutines-test = "1.11.0"
 mockk = "1.14.11"
-robolectric = "4.16.1"
-androidx-test-core = "1.6.1"
+robolectric = "4.17"
+androidx-test-core = "1.7.0"
 
 [libraries]
 androidx-work = {module = "androidx.work:work-runtime-ktx",version.ref = "work"}

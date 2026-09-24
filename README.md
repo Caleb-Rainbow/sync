@@ -2,7 +2,7 @@
 
 > 一个基于 WorkManager 的 Android 数据同步库，用于设备与服务器间的双向数据同步
 
-同步完整性修复、停用回补策略及 Room 事务接入见 [同步安全说明](SYNC_SAFETY.md)。
+同步完整性修复、停用推进策略及 Room 事务接入见 [同步安全说明](SYNC_SAFETY.md)。
 
 ## 目录
 
@@ -488,7 +488,7 @@ val description = syncOption.description // "设备单向上传"
 
 ```kotlin
 dependencies {
-    implementation("com.github.Caleb-Rainbow:sync:2026.07.10.01")
+    implementation("com.github.Caleb-Rainbow:sync:2026.09.24.01")
 }
 ```
 
@@ -1554,12 +1554,14 @@ override var batchSize: Int = 100 // 设置合适的批量大小
 
 ## 版本信息
 
-### 当前版本：2026.07.10.01
+### 当前版本：2026.09.24.01
 
 ### 版本历史
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| 2026.09.24.01 | 2026-09-24 | 移除停用任务冻结游标逻辑（删除 SyncCursorGuard）：停用/跳过/轮内选项变化不再阻止推进 syncDataTime，避免停用期间其他任务每轮重复处理旧数据；仅保留轮内账号/设备号变化不推进保护；KEY_SYNC_SKIPPED 保留为宿主 UI 状态标记 |
+| 2026.09.17.01 | 2026-09-17 | 加固同步事务回写（localUpsertAfterUpload/localReplaceAll）、KEEP 重复入队观察、取消传播与时间游标保护；上传附件删除条件收紧 |
 | 2026.07.10.01 | 2026-07-10 | 新增「覆盖本地」模式（serverDownloadModeInt）；SyncRepository 新增 localDeleteAll/localDeleteAllExcept；SyncConfigProvider 新增 uploadBatchSize/syncMode/lastSyncAttemptTime；saveSuccessfulSyncTime 线程安全（CAS 单调递增） |
 | 2026.02.03.01 | 2026-02-03 | 新增 SyncStats 统计数据类；优化日志性能（TAG 缓存、惰性求值）；改进异常处理和日志输出 |
 | 1.0.8 | 2025-01-26 | 重构日志系统，采用依赖注入方式；新增批量同步模式；优化同步性能 |
