@@ -131,7 +131,8 @@ abstract class BaseCompareWork<T : SyncableEntity, R : SyncRepository<T>>(
                 return@withContext Result.failure(createFailData("严重错误：未能获取到上次同步时间，任务中止。"))
             }
 
-            // 同步开关检查
+            // 同步开关检查：关闭视为本轮成功，不阻塞协调器推进游标。
+            // KEY_SYNC_SKIPPED 仅作状态标记供宿主 UI 识别，协调器不再据此冻结同步时间。
             if (syncOption == SyncOption.SYNC_OFF) {
                 libLogW("⏭️ 同步开关已关闭，任务跳过")
                 libLogI("  同步模式设置为 SYNC_OFF，不执行任何操作")

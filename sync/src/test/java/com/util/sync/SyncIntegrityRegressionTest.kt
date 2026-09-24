@@ -176,24 +176,15 @@ class SyncIntegrityRegressionTest {
         assertEquals("2026-09-17 10:02:00", repo.local.getValue(1).updateTime)
     }
 
-    @Test fun `disabled worker holds cursor and resumes from old timestamp`() {
+    @Test fun `disabled worker succeeds as noop and marks skipped for host ui`() {
         val repo = R().apply { remote = listOf(E(1)) }
-        val task = object : SyncTaskDefinition {
-            override val title = "test"
-            override val workerClass = W::class
-            override val subTasks = emptyList<SyncSubTask>()
-            override var syncOptionValue = 3
-        }
-        val guard = SyncCursorGuard(listOf(task))
         val result = run(repo, option = 3, overwrite = 0)
         assertTrue(result is ListenableWorker.Result.Success)
         assertTrue(result.outputData.getBoolean(KEY_SYNC_SKIPPED, false))
-        assertFalse(guard.canAdvance(listOf(task)))
-        task.syncOptionValue = 1
-        assertFalse(guard.canAdvance(listOf(task)))
+        assertTrue(repo.local.isEmpty())
+        // 重新启用后从当前游标正常同步
         assertTrue(run(repo, option = 1, overwrite = 0) is ListenableWorker.Result.Success)
         assertEquals(setOf(1L), repo.local.keys)
-        assertTrue(SyncCursorGuard(listOf(task)).canAdvance(listOf(task)))
     }
 
     @Test fun `upload and download hooks apply both callbacks`() {

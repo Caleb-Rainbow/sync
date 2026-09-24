@@ -5,12 +5,8 @@ import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.util.sync.KEY_SYNC_START_TIME
 import com.util.sync.SyncConfigProvider
-import com.util.sync.SyncCursorGuard
-import com.util.sync.KEY_SYNC_OPTIONS
 import com.util.sync.KEY_SYNC_USERNAME
 import com.util.sync.KEY_SYNC_DEVICE
-import com.util.sync.KEY_SYNC_SKIPPED
-import androidx.work.workDataOf
 import kotlinx.coroutines.CancellationException
 import com.util.sync.log.libLogD
 import com.util.sync.log.libLogE
@@ -65,15 +61,13 @@ class SyncSuccessUpdaterWorker(
         }
 
         try {
-            // 请求可能排队，提交前再复核配置，防止在等待期间关闭任务后仍前进游标。
-            val expectedOptions = inputData.getStringArray(KEY_SYNC_OPTIONS)
-            if (expectedOptions != null && (
-                !expectedOptions.contentEquals(SyncCursorGuard.signatureOf(configProvider.getAllTask())) ||
-                inputData.getString(KEY_SYNC_USERNAME) != configProvider.username ||
+            // 请求可能排队，提交前再复核身份，防止在等待期间切换账号后仍推进游标。
+            // 停用任务与同步选项变化不影响游标推进。
+            if (inputData.getString(KEY_SYNC_USERNAME) != configProvider.username ||
                 inputData.getString(KEY_SYNC_DEVICE) != configProvider.deviceNumber
-            )) {
-                libLogI("同步配置已变化，保留原同步时间")
-                return@withContext Result.success(workDataOf(KEY_SYNC_SKIPPED to true))
+            ) {
+                libLogI("同步期间账号或设备号已变化，保留原同步时间")
+                return@withContext Result.success()
             }
             // 获取更新前的时间戳（用于日志对比）
             val previousSyncTime = configProvider.syncDataTime

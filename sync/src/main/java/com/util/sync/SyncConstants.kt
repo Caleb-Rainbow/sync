@@ -15,9 +15,8 @@ const val KEY_SYNC_START_TIME = "KEY_SYNC_START_TIME"
 /** WorkManager Data 键：同步会话 ID */
 const val KEY_SYNC_SESSION_ID = "KEY_SYNC_SESSION_ID"
 
-/** 子任务本轮未执行，协调器不得据此推进全局游标。 */
+/** 子任务本轮未执行（如同步开关关闭）。仅供宿主 UI 识别状态，不再影响游标推进。 */
 const val KEY_SYNC_SKIPPED = "KEY_SYNC_SKIPPED"
-internal const val KEY_SYNC_OPTIONS = "KEY_SYNC_OPTIONS"
 internal const val KEY_SYNC_USERNAME = "KEY_SYNC_USERNAME"
 internal const val KEY_SYNC_DEVICE = "KEY_SYNC_DEVICE"
 

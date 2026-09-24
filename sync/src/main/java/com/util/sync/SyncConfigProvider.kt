@@ -46,7 +46,7 @@ interface SyncConfigProvider {
      */
     var lastSyncAttemptTime: String
 
-    /** 必须返回全部已注册任务（包括停用的任务），用于全局时间戳的安全推进判断。 */
+    /** 必须返回全部已注册任务（包括停用的任务），由各 Worker 自行按同步开关决定是否执行。 */
     fun getAllTask(): List<SyncTaskDefinition>
 }
 

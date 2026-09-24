@@ -18,10 +18,7 @@ import com.util.sync.KEY_SYNC_START_TIME
 import com.util.sync.SyncConfigProvider
 import com.util.sync.SyncTaskDefinition
 import com.util.sync.SyncTimeUtils
-import com.util.sync.SyncCursorGuard
 import com.util.sync.SyncExecutionGate
-import com.util.sync.KEY_SYNC_SKIPPED
-import com.util.sync.KEY_SYNC_OPTIONS
 import com.util.sync.KEY_SYNC_USERNAME
 import com.util.sync.KEY_SYNC_DEVICE
 import com.util.sync.createFailData
@@ -49,7 +46,9 @@ import kotlin.reflect.KClass
  * 1. 任务顺序执行，避免并发带来的性能问题
  * 2. 单个任务失败不影响后续任务的执行
  * 3. 失败任务在协调器内部重试（仅重试失败的任务，跳过已成功的）
- * 4. 只有所有任务都成功时，才触发 SyncSuccessUpdaterWorker 更新同步时间戳
+ * 4. 只有所有任务都成功时，才触发 SyncSuccessUpdaterWorker 更新同步时间戳。
+ *    同步开关关闭的任务由 Worker 自行返回成功，视为本轮已完成，不阻塞游标推进，
+ *    避免停用期间其他启用任务反复从旧游标重复处理数据。
  */
 class SyncCoordinatorWorker(
     private val context: Context,
@@ -136,7 +135,6 @@ class SyncCoordinatorWorker(
 
         // 获取所有需要执行的同步任务
         val allTasks = syncConfigProvider.getAllTask()
-        val cursorGuard = SyncCursorGuard(allTasks)
         libLogI("📋 任务列表: 共 ${allTasks.size} 个任务")
 
         allTasks.forEachIndexed { index, task ->
@@ -199,7 +197,6 @@ class SyncCoordinatorWorker(
 
                     when (workInfo.state) {
                         WorkInfo.State.SUCCEEDED -> {
-                            if (workInfo.outputData.getBoolean(KEY_SYNC_SKIPPED, false)) cursorGuard.skipped = true
                             libLogI("    ✅ 任务成功: $taskName, 耗时: ${taskDuration}ms")
                             attemptResults.add(TaskResult(taskName, workerClassName, task, true, taskDuration))
                         }
@@ -266,9 +263,11 @@ class SyncCoordinatorWorker(
         libLogI("────────────────────────────────────────")
 
         // 根据任务执行结果决定是否触发 SyncSuccessUpdaterWorker
-        val canAdvance = cursorGuard.canAdvance(syncConfigProvider.getAllTask()) &&
-            initialUsername == syncConfigProvider.username && initialDevice == syncConfigProvider.deviceNumber
-        if (allTasksSucceeded && canAdvance) {
+        // 停用任务、任务跳过与同步选项轮内变化均视为成功，照常推进游标；
+        // 仅账号/设备号在轮内变化时不推进，避免把游标写到另一个身份的同步进度上。
+        val identityUnchanged = initialUsername == syncConfigProvider.username &&
+            initialDevice == syncConfigProvider.deviceNumber
+        if (allTasksSucceeded && identityUnchanged) {
             libLogI("🏆 所有任务执行成功，准备更新同步时间戳")
 
             try {
@@ -277,7 +276,6 @@ class SyncCoordinatorWorker(
                     .addTag(GLOBAL_SYNC_WORK_NAME)
                     .setInputData(workDataOf(
                         KEY_SYNC_START_TIME to syncStartTime,
-                        KEY_SYNC_OPTIONS to cursorGuard.signature,
                         KEY_SYNC_USERNAME to initialUsername,
                         KEY_SYNC_DEVICE to initialDevice,
                     ))
@@ -298,7 +296,7 @@ class SyncCoordinatorWorker(
                 libLogE("  💥 SyncSuccessUpdaterWorker 执行异常", e)
             }
         } else if (allTasksSucceeded) {
-            libLogI("⏸️ 有任务停用、跳过或配置变化，保留原同步时间供恢复后回补")
+            libLogI("⏸️ 同步期间账号或设备号已变化，本轮不推进同步时间")
         } else {
             libLogW("⚠️ 存在失败的任务，跳过更新同步时间戳")
             libLogW("  失败任务将在下次同步时重试")

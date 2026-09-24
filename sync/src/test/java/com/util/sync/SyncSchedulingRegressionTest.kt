@@ -161,38 +161,37 @@ class SyncSchedulingRegressionTest {
         }
     }
 
-    @Test fun `timestamp updater rechecks snapshot after enqueue`() = runBlocking {
+    @Test fun `timestamp updater rechecks identity after enqueue`() = runBlocking {
         withTimeout(15_000) {
-            val task = Task(SuccessfulWorker::class)
-            settings.tasks = listOf(task)
-            val expected = SyncCursorGuard.signatureOf(settings.tasks)
-            task.syncOptionValue = 3
+            settings.tasks = listOf(Task(SuccessfulWorker::class))
+            // 输入携带的账号与当前配置不一致（模拟排队期间切换账号）
             val request = OneTimeWorkRequestBuilder<SyncSuccessUpdaterWorker>().setInputData(workDataOf(
                 KEY_SYNC_START_TIME to "2026-09-17 12:00:00",
-                KEY_SYNC_OPTIONS to expected,
-                KEY_SYNC_USERNAME to settings.username,
+                KEY_SYNC_USERNAME to "stale-user",
                 KEY_SYNC_DEVICE to settings.deviceNumber,
             )).build()
             manager.enqueue(request).await()
             val result = terminal(request.id)
             assertEquals(WorkInfo.State.SUCCEEDED, result.state)
-            assertTrue(result.outputData.getBoolean(KEY_SYNC_SKIPPED, false))
             assertEquals(0, settings.saves.get())
         }
     }
 
-    @Test fun `disabled task freezes global cursor but does not block enabled work`() = runBlocking {
+    @Test fun `disabled task counts as success and advances cursor`() = runBlocking {
         withTimeout(15_000) {
-            settings.tasks = listOf(Task(SuccessfulWorker::class, syncOptionValue = 3))
+            settings.tasks = listOf(
+                Task(SuccessfulWorker::class),
+                Task(SuccessfulWorker::class, syncOptionValue = 3),
+            )
             val request = OneTimeWorkRequestBuilder<SyncCoordinatorWorker>().build()
             manager.enqueue(request).await()
             assertEquals(WorkInfo.State.SUCCEEDED, terminal(request.id).state)
-            assertEquals("2026-01-01 00:00:00", settings.syncDataTime)
-            assertEquals(0, settings.saves.get())
+            assertEquals(1, settings.saves.get())
+            assertTrue(settings.syncDataTime > "2026-01-01 00:00:00")
         }
     }
 
-    @Test fun `configuration changed while child runs holds original cursor`() = runBlocking {
+    @Test fun `option change while child runs still advances cursor`() = runBlocking {
         withTimeout(15_000) {
             val task = Task(BlockingWorker::class)
             settings.tasks = listOf(task)
@@ -200,6 +199,19 @@ class SyncSchedulingRegressionTest {
             manager.enqueue(request).await()
             state.started.await()
             task.syncOptionValue = 3
+            state.release.complete(Unit)
+            assertEquals(WorkInfo.State.SUCCEEDED, terminal(request.id).state)
+            assertEquals(1, settings.saves.get())
+        }
+    }
+
+    @Test fun `identity change while child runs holds cursor`() = runBlocking {
+        withTimeout(15_000) {
+            settings.tasks = listOf(Task(BlockingWorker::class))
+            val request = OneTimeWorkRequestBuilder<SyncCoordinatorWorker>().build()
+            manager.enqueue(request).await()
+            state.started.await()
+            settings.deviceNumber = "another-device"
             state.release.complete(Unit)
             assertEquals(WorkInfo.State.SUCCEEDED, terminal(request.id).state)
             assertEquals(0, settings.saves.get())
